@@ -1,9 +1,10 @@
 /*
  * receiver.c — Example DAQ data receiver with DiDAQt heartbeats
  *
- * Receives Ethernet/IPv4/UDP frames on a raw socket, validates the
- * 8-byte magic value at the start of the UDP payload, and calls
- * schedule_heartbeat() for every sender whose data passes validation.
+ * Receives Ethernet frames on a raw socket, handling both plain and
+ * 802.1Q VLAN-tagged frames.  Validates the 8-byte magic value at
+ * the start of the UDP payload and calls schedule_heartbeat() for
+ * every sender whose data passes validation.
  *
  * The DiDAQt receiver context runs a background thread that
  * periodically sends heartbeat packets to the controller.
@@ -44,9 +45,9 @@
 
 #define FRAME_MAX      1600
 #define ETH_HDR_LEN    14
+#define VLAN_HDR_LEN   4
 #define IP_HDR_LEN     20
 #define UDP_HDR_LEN    8
-#define MAGIC_OFFSET   (ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN)
 
 /* Must match the sender's magic value. */
 #define SENDER_MAGIC   0xD1DA0754CAFE00AAULL
@@ -60,19 +61,31 @@ static void handle_signal(int sig)
 }
 
 /* --------------------------------------------------------------- */
-/*  Extract a sender ID from a received frame                       */
+/*  Frame helpers                                                   */
 /* --------------------------------------------------------------- */
+
+/*
+ * Return the L2 header length for a frame: 14 for plain Ethernet,
+ * 18 if an 802.1Q VLAN tag is present.
+ */
+static int l2_hdr_len(const uint8_t *frame)
+{
+    uint16_t etype;
+    memcpy(&etype, frame + 12, 2);
+    return (etype == htons(0x8100)) ? ETH_HDR_LEN + VLAN_HDR_LEN
+                                    : ETH_HDR_LEN;
+}
 
 /*
  * Derive a sender ID from the source IP address in the IPv4 header.
  * The sender encodes its ID as the third octet of 10.0.<id>.1, so
- * we just pull that byte.
+ * we pull that byte.  l2len is the L2 header length (14 or 18).
  */
-static uint32_t sender_id_from_frame(const uint8_t *frame)
+static uint32_t sender_id_from_frame(const uint8_t *frame, int l2len)
 {
-    const uint8_t *ip = frame + ETH_HDR_LEN;
-    /* Source IP is at offset 12 within the IPv4 header. */
-    return (uint32_t)ip[14];   /* third octet of src IP */
+    const uint8_t *ip = frame + l2len;
+    /* Source IP offset 12 within IP header; third octet at +14. */
+    return (uint32_t)ip[14];
 }
 
 /* --------------------------------------------------------------- */
@@ -108,8 +121,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* --- Open raw receive socket --- */
-    int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
+    /* --- Open raw receive socket ---
+     * Use ETH_P_ALL to capture both plain and VLAN-tagged frames. */
+    int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sockfd < 0) {
         perror("socket");
         didaqt_rx_stop(ctx);
@@ -131,7 +145,7 @@ int main(int argc, char **argv)
     memset(&sll, 0, sizeof(sll));
     sll.sll_family   = AF_PACKET;
     sll.sll_ifindex  = ifr.ifr_ifindex;
-    sll.sll_protocol = htons(ETH_P_IP);
+    sll.sll_protocol = htons(ETH_P_ALL);
 
     if (bind(sockfd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
         perror("bind");
@@ -159,24 +173,36 @@ int main(int argc, char **argv)
             break;
         }
 
-        /* Need at least headers + 8-byte magic. */
-        if (n < MAGIC_OFFSET + 8)
+        /* Determine L2 header length (handles VLAN or plain). */
+        if (n < ETH_HDR_LEN)
+            continue;
+        int l2len = l2_hdr_len(frame);
+
+        /* Minimum: L2 + IP + UDP + 8-byte magic. */
+        if (n < l2len + IP_HDR_LEN + UDP_HDR_LEN + 8)
+            continue;
+
+        /* Check EtherType after any VLAN tag is IPv4 (0x0800). */
+        uint16_t inner_etype;
+        memcpy(&inner_etype, frame + l2len - 2, 2);
+        if (inner_etype != htons(0x0800))
             continue;
 
         /* Verify IP protocol is UDP. */
-        uint8_t proto = frame[ETH_HDR_LEN + 9];
+        uint8_t proto = frame[l2len + 9];
         if (proto != 17)
             continue;
 
         rx_count++;
 
         /* Validate the 8-byte magic at the start of the UDP payload. */
+        int magic_off = l2len + IP_HDR_LEN + UDP_HDR_LEN;
         uint64_t magic;
-        memcpy(&magic, frame + MAGIC_OFFSET, sizeof(magic));
+        memcpy(&magic, frame + magic_off, sizeof(magic));
         magic = be64toh(magic);
 
         if (magic == SENDER_MAGIC) {
-            uint32_t s_id = sender_id_from_frame(frame);
+            uint32_t s_id = sender_id_from_frame(frame, l2len);
             schedule_heartbeat(s_id, ctx);
             rx_valid++;
         }

@@ -27,13 +27,16 @@ $(BUILD_DIR):
 # sender and receiver build on any Linux host.
 # controller requires the Intel Barefoot SDE ($SDE_INSTALL).
 
-examples: $(BUILD_DIR)/sender $(BUILD_DIR)/receiver
+examples: $(BUILD_DIR)/sender $(BUILD_DIR)/receiver $(BUILD_DIR)/heartbeat_monitor
 
 $(BUILD_DIR)/sender: examples/sender.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -O2 -o $@ $<
 
 $(BUILD_DIR)/receiver: examples/receiver.c $(LIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -O2 -o $@ $< -L$(BUILD_DIR) -ldidaqt -lpthread
+
+$(BUILD_DIR)/heartbeat_monitor: artifact/heartbeat_monitor.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -O2 -o $@ $<
 
 # Build controller only when SDE_INSTALL is set.
 controller: examples/controller.c | $(BUILD_DIR)

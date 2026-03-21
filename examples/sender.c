@@ -2,20 +2,25 @@
  * sender.c — Example DAQ data sender
  *
  * Sends a 10 Gbps stream of 1500-byte Ethernet frames over a raw
- * AF_PACKET socket.  Each frame is Ethernet/IPv4/UDP with an 8-byte
- * magic value (SENDER_MAGIC) at the start of the UDP payload,
+ * AF_PACKET socket.  Each frame is Ethernet/802.1Q/IPv4/UDP with an
+ * 8-byte magic value (SENDER_MAGIC) at the start of the UDP payload,
  * followed by padding to fill the frame.
+ *
+ * When vlan_id is 0, frames are sent without a VLAN tag and the full
+ * 1458-byte payload is available.  When vlan_id > 0, the 4-byte
+ * 802.1Q header is included and the payload shrinks to 1454 bytes
+ * so the total frame stays at 1500.
  *
  * The sender is a "black box" from DiDAQt's perspective (requirement
  * R2) — it has no awareness of the fault-detection framework.
  *
  * Usage:
- *   ./sender <interface> <dst_mac> <sender_id>
+ *   ./sender <interface> <dst_mac> <sender_id> [vlan_id]
  *
  * Example:
- *   ./sender eth0 00:11:22:33:44:55 1
+ *   ./sender eth0 00:11:22:33:44:55 1 100
  *
- * Build (on a Linux host with the SDE environment or standalone):
+ * Build (on a Linux host):
  *   gcc -O2 -Wall -o sender sender.c
  */
 
@@ -43,9 +48,9 @@
 
 #define FRAME_LEN      1500            /* Total Ethernet frame size */
 #define ETH_HDR_LEN    14
+#define VLAN_HDR_LEN   4
 #define IP_HDR_LEN     20
 #define UDP_HDR_LEN    8
-#define PAYLOAD_LEN    (FRAME_LEN - ETH_HDR_LEN - IP_HDR_LEN - UDP_HDR_LEN)
 
 /* 8-byte magic value written at the start of every UDP payload.
  * Receivers validate this to confirm data integrity.             */
@@ -86,27 +91,46 @@ static uint16_t ip_checksum(const void *buf, int len)
     return (uint16_t)~sum;
 }
 
-/* Build a complete Ethernet/IPv4/UDP frame template.
- * src/dst IPs are arbitrary — the switches forward on MAC only. */
-static void build_frame(uint8_t *frame,
-                        const uint8_t src_mac[6],
-                        const uint8_t dst_mac[6],
-                        uint32_t sender_id)
+/*
+ * Build a complete Ethernet(/VLAN)/IPv4/UDP frame template.
+ * src/dst IPs are arbitrary — the switches forward on MAC only.
+ *
+ * Returns the actual frame length written (always FRAME_LEN).
+ */
+static int build_frame(uint8_t *frame,
+                       const uint8_t src_mac[6],
+                       const uint8_t dst_mac[6],
+                       uint32_t sender_id,
+                       uint16_t vlan_id)
 {
+    int use_vlan = (vlan_id > 0);
+    int l2_len   = ETH_HDR_LEN + (use_vlan ? VLAN_HDR_LEN : 0);
+    int payload_len = FRAME_LEN - l2_len - IP_HDR_LEN - UDP_HDR_LEN;
+
     memset(frame, 0, FRAME_LEN);
 
     /* --- Ethernet header --- */
-    memcpy(frame + 0, dst_mac, 6);
-    memcpy(frame + 6, src_mac, 6);
-    frame[12] = 0x08; frame[13] = 0x00;   /* EtherType = IPv4 */
+    uint8_t *p = frame;
+    memcpy(p, dst_mac, 6);  p += 6;
+    memcpy(p, src_mac, 6);  p += 6;
+
+    if (use_vlan) {
+        /* 802.1Q: TPID + TCI */
+        p[0] = 0x81; p[1] = 0x00;  p += 2;         /* TPID */
+        uint16_t tci = htons(vlan_id & 0x0FFF);
+        memcpy(p, &tci, 2);        p += 2;          /* TCI  */
+    }
+
+    /* EtherType = IPv4 */
+    p[0] = 0x08; p[1] = 0x00;  p += 2;
 
     /* --- IPv4 header (20 bytes, no options) --- */
-    uint8_t *ip = frame + ETH_HDR_LEN;
-    ip[0]  = 0x45;                         /* version + IHL */
-    uint16_t ip_total = htons(IP_HDR_LEN + UDP_HDR_LEN + PAYLOAD_LEN);
-    memcpy(ip + 2, &ip_total, 2);          /* total length */
-    ip[8]  = 64;                           /* TTL */
-    ip[9]  = 17;                           /* protocol = UDP */
+    uint8_t *ip = p;
+    ip[0]  = 0x45;                                   /* version + IHL */
+    uint16_t ip_total = htons(IP_HDR_LEN + UDP_HDR_LEN + payload_len);
+    memcpy(ip + 2, &ip_total, 2);                    /* total length  */
+    ip[8]  = 64;                                     /* TTL           */
+    ip[9]  = 17;                                     /* protocol=UDP  */
     /* src IP = 10.0.<sender_id>.1, dst IP = 10.0.<sender_id>.2 */
     ip[12] = 10; ip[13] = 0; ip[14] = (uint8_t)sender_id; ip[15] = 1;
     ip[16] = 10; ip[17] = 0; ip[18] = (uint8_t)sender_id; ip[19] = 2;
@@ -117,7 +141,7 @@ static void build_frame(uint8_t *frame,
     uint8_t *udp = ip + IP_HDR_LEN;
     uint16_t sport = htons(50000);
     uint16_t dport = htons(50000);
-    uint16_t udp_len = htons(UDP_HDR_LEN + PAYLOAD_LEN);
+    uint16_t udp_len = htons(UDP_HDR_LEN + payload_len);
     memcpy(udp + 0, &sport, 2);
     memcpy(udp + 2, &dport, 2);
     memcpy(udp + 4, &udp_len, 2);
@@ -130,8 +154,10 @@ static void build_frame(uint8_t *frame,
 
     /* Remaining payload bytes: fill with sender_id pattern. */
     uint32_t sid_n = htonl(sender_id);
-    for (int i = 8; i + 3 < PAYLOAD_LEN; i += 4)
+    for (int i = 8; i + 3 < payload_len; i += 4)
         memcpy(payload + i, &sid_n, 4);
+
+    return FRAME_LEN;
 }
 
 /* --------------------------------------------------------------- */
@@ -140,8 +166,9 @@ static void build_frame(uint8_t *frame,
 
 int main(int argc, char **argv)
 {
-    if (argc != 4) {
-        fprintf(stderr, "Usage: %s <interface> <dst_mac> <sender_id>\n",
+    if (argc < 4 || argc > 5) {
+        fprintf(stderr,
+                "Usage: %s <interface> <dst_mac> <sender_id> [vlan_id]\n",
                 argv[0]);
         return 1;
     }
@@ -149,6 +176,7 @@ int main(int argc, char **argv)
     const char *ifname    = argv[1];
     const char *dst_mac_s = argv[2];
     uint32_t sender_id    = (uint32_t)atoi(argv[3]);
+    uint16_t vlan_id      = (argc == 5) ? (uint16_t)atoi(argv[4]) : 0;
 
     uint8_t dst_mac[6];
     if (parse_mac(dst_mac_s, dst_mac) != 0) {
@@ -198,13 +226,13 @@ int main(int argc, char **argv)
 
     /* Build the frame template (reused for every send). */
     uint8_t frame[FRAME_LEN];
-    build_frame(frame, src_mac, dst_mac, sender_id);
+    build_frame(frame, src_mac, dst_mac, sender_id, vlan_id);
 
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
-    printf("sender %u: sending %d-byte frames on %s -> %s\n",
-           sender_id, FRAME_LEN, ifname, dst_mac_s);
+    printf("sender %u: sending %d-byte frames on %s -> %s (vlan %u)\n",
+           sender_id, FRAME_LEN, ifname, dst_mac_s, vlan_id);
 
     /* --- Transmit loop --- */
     uint64_t tx_count = 0;

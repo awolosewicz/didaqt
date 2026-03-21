@@ -1,9 +1,12 @@
 /*
- * l2_forward.p4 — L2 MAC forwarding for Tofino 2 (TNA)
+ * l2_forward.p4 — VLAN-aware L2 MAC forwarding for Tofino 2 (TNA)
  *
- * Simple exact-match on destination MAC address to forward frames
- * to a specific egress port.  The controller populates and updates
- * the "l2_forward" table at runtime via BF Runtime.
+ * Parses Ethernet and optional 802.1Q VLAN headers.  Exact-match on
+ * destination MAC address to forward frames to a specific egress port
+ * with a rewritten VLAN ID (each L2PTP link uses its own VLAN).
+ *
+ * The controller populates and updates the "l2_forward" table at
+ * runtime via BF Runtime.
  */
 
 #include <core.p4>
@@ -17,11 +20,21 @@ header ethernet_h {
     bit<16> ether_type;
 }
 
+header vlan_tag_h {
+    bit<3>  pcp;
+    bit<1>  dei;
+    bit<12> vid;
+    bit<16> ether_type;
+}
+
 struct headers_t {
     ethernet_h ethernet;
+    vlan_tag_h vlan;
 }
 
 struct metadata_t {}
+
+const bit<16> ETHERTYPE_VLAN = 0x8100;
 
 /* ---------- Ingress Parser ---------- */
 
@@ -39,6 +52,14 @@ parser IngressParser(
 
     state parse_ethernet {
         pkt.extract(hdr.ethernet);
+        transition select(hdr.ethernet.ether_type) {
+            ETHERTYPE_VLAN : parse_vlan;
+            default        : accept;
+        }
+    }
+
+    state parse_vlan {
+        pkt.extract(hdr.vlan);
         transition accept;
     }
 }
@@ -53,8 +74,9 @@ control Ingress(
         inout ingress_intrinsic_metadata_for_deparser_t ig_dprsr_md,
         inout ingress_intrinsic_metadata_for_tm_t ig_tm_md) {
 
-    action forward(PortId_t port) {
+    action forward(PortId_t port, bit<12> vlan_id) {
         ig_tm_md.ucast_egress_port = port;
+        hdr.vlan.vid = vlan_id;
     }
 
     action drop() {
@@ -106,6 +128,14 @@ parser EgressParser(
 
     state parse_ethernet {
         pkt.extract(hdr.ethernet);
+        transition select(hdr.ethernet.ether_type) {
+            ETHERTYPE_VLAN : parse_vlan;
+            default        : accept;
+        }
+    }
+
+    state parse_vlan {
+        pkt.extract(hdr.vlan);
         transition accept;
     }
 }
