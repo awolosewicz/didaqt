@@ -11,10 +11,11 @@
 struct didaqt_rx_ctx {
     uint32_t  r_id;
 
-    /* Controller destination. */
-    struct sockaddr_in ctrl_addr;
-    int                ctrl_addr_set;
-    int                sockfd;
+    /* Controller destination (IPv4 or IPv6). */
+    struct sockaddr_storage ctrl_addr;
+    socklen_t               ctrl_addr_len;
+    int                     ctrl_addr_set;
+    int                     sockfd;
 
     /* Heartbeat interval. */
     uint32_t  interval_ms;
@@ -99,7 +100,7 @@ static void *heartbeat_loop(void *arg)
         if (len > 0) {
             sendto(ctx->sockfd, pkt, (size_t)len, 0,
                    (struct sockaddr *)&ctx->ctrl_addr,
-                   sizeof(ctx->ctrl_addr));
+                   ctx->ctrl_addr_len);
         }
     }
 
@@ -119,12 +120,13 @@ int didaqt_rx_init_ctx(uint32_t r_id, didaqt_rx_ctx **ctx)
     if (!c)
         return DIDAQT_ERR;
 
-    c->r_id         = r_id;
-    c->interval_ms  = DIDAQT_DEFAULT_HB_INTERVAL_MS;
-    c->sender_count = 0;
-    c->running      = 0;
-    c->sockfd       = -1;
+    c->r_id          = r_id;
+    c->interval_ms   = DIDAQT_DEFAULT_HB_INTERVAL_MS;
+    c->sender_count  = 0;
+    c->running       = 0;
+    c->sockfd        = -1;
     c->ctrl_addr_set = 0;
+    c->ctrl_addr_len = 0;
 
     if (pthread_mutex_init(&c->lock, NULL) != 0) {
         free(c);
@@ -142,14 +144,27 @@ int didaqt_rx_set_controller(didaqt_rx_ctx *ctx,
         return DIDAQT_ERR;
 
     memset(&ctx->ctrl_addr, 0, sizeof(ctx->ctrl_addr));
-    ctx->ctrl_addr.sin_family = AF_INET;
-    ctx->ctrl_addr.sin_port   = htons(port);
 
-    if (inet_pton(AF_INET, ip, &ctx->ctrl_addr.sin_addr) != 1)
-        return DIDAQT_ERR;
+    /* Try IPv4 first, then IPv6. */
+    struct sockaddr_in *a4 = (struct sockaddr_in *)&ctx->ctrl_addr;
+    if (inet_pton(AF_INET, ip, &a4->sin_addr) == 1) {
+        a4->sin_family = AF_INET;
+        a4->sin_port   = htons(port);
+        ctx->ctrl_addr_len = sizeof(*a4);
+        ctx->ctrl_addr_set = 1;
+        return DIDAQT_OK;
+    }
 
-    ctx->ctrl_addr_set = 1;
-    return DIDAQT_OK;
+    struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ctx->ctrl_addr;
+    if (inet_pton(AF_INET6, ip, &a6->sin6_addr) == 1) {
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port   = htons(port);
+        ctx->ctrl_addr_len = sizeof(*a6);
+        ctx->ctrl_addr_set = 1;
+        return DIDAQT_OK;
+    }
+
+    return DIDAQT_ERR;
 }
 
 int didaqt_rx_set_interval(didaqt_rx_ctx *ctx, uint32_t interval_ms)
@@ -165,7 +180,8 @@ int didaqt_rx_start(didaqt_rx_ctx *ctx)
     if (!ctx || !ctx->ctrl_addr_set || ctx->running)
         return DIDAQT_ERR;
 
-    ctx->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    int af = ((struct sockaddr *)&ctx->ctrl_addr)->sa_family;
+    ctx->sockfd = socket(af, SOCK_DGRAM, 0);
     if (ctx->sockfd < 0)
         return DIDAQT_ERR;
 

@@ -5,6 +5,8 @@
  * a live status display showing which senders each receiver reports
  * as healthy.
  *
+ * Binds on IPv6 with dual-stack (accepts both IPv4 and IPv6 senders).
+ *
  * Usage:
  *   ./heartbeat_monitor <port>
  *
@@ -47,7 +49,9 @@ int main(int argc, char **argv)
 
     uint16_t port = (uint16_t)atoi(argv[1]);
 
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    /* Create an IPv6 socket with dual-stack so it accepts both
+     * IPv4 and IPv6 heartbeat senders. */
+    int sockfd = socket(AF_INET6, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         perror("socket");
         return 1;
@@ -56,11 +60,15 @@ int main(int argc, char **argv)
     int opt = 1;
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in addr;
+    /* Allow IPv4 connections on this IPv6 socket (dual-stack). */
+    int v6only = 0;
+    setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+
+    struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(port);
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr   = in6addr_any;
+    addr.sin6_port   = htons(port);
 
     if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
@@ -71,7 +79,7 @@ int main(int argc, char **argv)
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
-    printf("heartbeat monitor listening on UDP port %u\n", port);
+    printf("heartbeat monitor listening on UDP port %u (IPv4+IPv6)\n", port);
 
     /*
      * Heartbeat wire format (network byte order):
@@ -83,7 +91,7 @@ int main(int argc, char **argv)
     uint64_t hb_count = 0;
 
     while (running) {
-        struct sockaddr_in src;
+        struct sockaddr_storage src;
         socklen_t src_len = sizeof(src);
 
         ssize_t n = recvfrom(sockfd, buf, sizeof(buf), 0,
@@ -131,8 +139,15 @@ int main(int argc, char **argv)
         char timestr[32];
         strftime(timestr, sizeof(timestr), "%H:%M:%S", tm);
 
-        char src_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));
+        /* Format source address (handles both IPv4-mapped and native IPv6). */
+        char src_ip[INET6_ADDRSTRLEN];
+        if (src.ss_family == AF_INET) {
+            struct sockaddr_in *s4 = (struct sockaddr_in *)&src;
+            inet_ntop(AF_INET, &s4->sin_addr, src_ip, sizeof(src_ip));
+        } else {
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&src;
+            inet_ntop(AF_INET6, &s6->sin6_addr, src_ip, sizeof(src_ip));
+        }
 
         printf("[%s.%03ld] HB #%lu from %s | receiver %u: "
                "%u sender(s) healthy: [%s]\n",
