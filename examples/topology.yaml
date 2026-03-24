@@ -1,0 +1,310 @@
+# Example DiDAQt topology for the FABRIC experiment.
+#
+# 10 senders → 1 switch (Tofino 2) → 2 receivers
+#
+# Initial configuration: all 10 senders route to receiver R0.
+# Receiver R1 is available as a failover target.
+#
+# Port layout on the switch:
+#   Port 1: connected to sender node (all 10 senders share this link)
+#   Port 2: (spare sender link for future use)
+#   Port 3: connected to receiver R0
+#   Port 4: connected to receiver R1
+
+- name: S1
+  type: sender
+  sender_id: 1
+  sender_id_bytes: 26
+  max_bandwidth: 10G
+  initial_receiver: R0
+  group_id: 0
+  connections:
+    1:
+      other_node: SW1
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S1
+          receiver: R0
+
+- name: S2
+  type: sender
+  sender_id: 2
+  sender_id_bytes: 26
+  max_bandwidth: 10G
+  initial_receiver: R0
+  group_id: 0
+  connections:
+    1:
+      other_node: SW1
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S2
+          receiver: R0
+
+- name: S3
+  type: sender
+  sender_id: 3
+  sender_id_bytes: 26
+  max_bandwidth: 10G
+  initial_receiver: R0
+  group_id: 0
+  connections:
+    1:
+      other_node: SW1
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S3
+          receiver: R0
+
+- name: S4
+  type: sender
+  sender_id: 4
+  sender_id_bytes: 26
+  max_bandwidth: 10G
+  initial_receiver: R0
+  group_id: 0
+  connections:
+    1:
+      other_node: SW1
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S4
+          receiver: R0
+
+- name: S5
+  type: sender
+  sender_id: 5
+  sender_id_bytes: 26
+  max_bandwidth: 10G
+  initial_receiver: R0
+  group_id: 0
+  connections:
+    1:
+      other_node: SW1
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S5
+          receiver: R0
+
+- name: S6
+  type: sender
+  sender_id: 6
+  sender_id_bytes: 26
+  max_bandwidth: 10G
+  initial_receiver: R0
+  group_id: 0
+  connections:
+    1:
+      other_node: SW1
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S6
+          receiver: R0
+
+- name: S7
+  type: sender
+  sender_id: 7
+  sender_id_bytes: 26
+  max_bandwidth: 10G
+  initial_receiver: R0
+  group_id: 0
+  connections:
+    1:
+      other_node: SW1
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S7
+          receiver: R0
+
+- name: S8
+  type: sender
+  sender_id: 8
+  sender_id_bytes: 26
+  max_bandwidth: 10G
+  initial_receiver: R0
+  group_id: 0
+  connections:
+    1:
+      other_node: SW1
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S8
+          receiver: R0
+
+- name: S9
+  type: sender
+  sender_id: 9
+  sender_id_bytes: 26
+  max_bandwidth: 10G
+  initial_receiver: R0
+  group_id: 0
+  connections:
+    1:
+      other_node: SW1
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S9
+          receiver: R0
+
+- name: S10
+  type: sender
+  sender_id: 10
+  sender_id_bytes: 26
+  max_bandwidth: 10G
+  initial_receiver: R0
+  group_id: 0
+  connections:
+    1:
+      other_node: SW1
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S10
+          receiver: R0
+
+- name: SW1
+  type: switch
+  switch_type_group: tofino2
+  connections:
+    1:
+      other_node: S1
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S1
+          receiver: R0
+        2:
+          sender: S2
+          receiver: R0
+        3:
+          sender: S3
+          receiver: R0
+        4:
+          sender: S4
+          receiver: R0
+        5:
+          sender: S5
+          receiver: R0
+        6:
+          sender: S6
+          receiver: R0
+        7:
+          sender: S7
+          receiver: R0
+        8:
+          sender: S8
+          receiver: R0
+        9:
+          sender: S9
+          receiver: R0
+        10:
+          sender: S10
+          receiver: R0
+    3:
+      other_node: R0
+      other_port: 1
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S1
+          receiver: R0
+        2:
+          sender: S2
+          receiver: R0
+        3:
+          sender: S3
+          receiver: R0
+        4:
+          sender: S4
+          receiver: R0
+        5:
+          sender: S5
+          receiver: R0
+        6:
+          sender: S6
+          receiver: R0
+        7:
+          sender: S7
+          receiver: R0
+        8:
+          sender: S8
+          receiver: R0
+        9:
+          sender: S9
+          receiver: R0
+        10:
+          sender: S10
+          receiver: R0
+    4:
+      other_node: R1
+      other_port: 1
+      max_bandwidth: 100G
+
+- name: R0
+  type: receiver
+  receiver_id: 0
+  connections:
+    1:
+      other_node: SW1
+      other_port: 3
+      max_bandwidth: 100G
+      initial_connections:
+        1:
+          sender: S1
+          receiver: R0
+        2:
+          sender: S2
+          receiver: R0
+        3:
+          sender: S3
+          receiver: R0
+        4:
+          sender: S4
+          receiver: R0
+        5:
+          sender: S5
+          receiver: R0
+        6:
+          sender: S6
+          receiver: R0
+        7:
+          sender: S7
+          receiver: R0
+        8:
+          sender: S8
+          receiver: R0
+        9:
+          sender: S9
+          receiver: R0
+        10:
+          sender: S10
+          receiver: R0
+
+- name: R1
+  type: receiver
+  receiver_id: 1
+  connections:
+    1:
+      other_node: SW1
+      other_port: 4
+      max_bandwidth: 100G

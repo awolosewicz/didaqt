@@ -1,39 +1,26 @@
 /*
- * controller.c — Example network controller for Tofino 2 switches
+ * controller.c — DiDAQt controller node
  *
- * Manages L2 forwarding tables on Tofino 2 switches via the BF
- * Runtime (bfrt) C API.  Provides:
+ * Loads a network topology from a YAML file, performs static
+ * reachability analysis, then listens for heartbeat packets and
+ * runs the failover state machine.
  *
- *   1. Initial configuration: populates l2_forward table entries so
- *      each receiver's MAC maps to the correct egress port on every
- *      switch in the path.
- *
- *   2. Runtime updates: add/modify/delete individual forwarding
- *      entries.  This is the hook point for integrating the DiDAQt
- *      controller API — when a fail-over is needed, the controller
- *      calls update_l2_entry() to reroute traffic.
- *
- * This code links against the Intel Barefoot SDE.  Build with:
- *   gcc -O2 -Wall -I$SDE_INSTALL/include \
- *       -L$SDE_INSTALL/lib -o controller controller.c \
- *       -lbf_switchd_lib -lbfrt -lpthread
+ * When a switch agent address is provided, failover actions are
+ * sent as TCP commands to the agent running on the Tofino, and
+ * the round-trip time is measured and printed.
  *
  * Usage:
- *   ./controller <config_file>
+ *   ./controller <topology.yaml> <heartbeat_port> [switch_agent_host:port]
  *
- * The config file is a simple text format (one entry per line):
- *   <mac_address> <egress_port>
- * Example:
- *   00:11:22:33:44:55 128
- *   00:11:22:33:44:66 136
+ * Examples:
+ *   ./controller topology.yaml 9000                     # log-only mode
+ *   ./controller topology.yaml 9000 10.0.0.5:9200       # live switch updates
  *
- * After loading the initial config, the controller listens on a TCP
- * socket for runtime update commands:
- *   ADD <mac> <port>
- *   MOD <mac> <port>
- *   DEL <mac>
+ * Build:
+ *   make build/controller
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -41,434 +28,323 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
-#include <pthread.h>
+#include <time.h>
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
 
-#include <bf_rt/bf_rt.h>
-
-/* --------------------------------------------------------------- */
-/*  Constants                                                       */
-/* --------------------------------------------------------------- */
-
-#define P4_PROG_NAME    "l2_forward"
-#define TABLE_NAME      "Ingress.l2_forward"
-#define ACTION_FWD      "Ingress.forward"
-#define ACTION_DROP     "Ingress.drop"
-
-#define CMD_PORT        9100          /* TCP port for runtime commands */
-#define CMD_BUF_LEN     256
-#define MAX_INIT_ENTRIES 1024
+#include "didaqt.h"
 
 static volatile int running = 1;
 
-/* --------------------------------------------------------------- */
-/*  BF Runtime handles (initialised once)                           */
-/* --------------------------------------------------------------- */
-
-static const bf_rt_info_hdl   *bfrt_info   = NULL;
-static bf_rt_session_hdl      *session     = NULL;
-static bf_rt_target_t          dev_tgt     = {0, BF_DEV_PIPE_ALL};
-static const bf_rt_table_hdl  *l2_table    = NULL;
-
-static bf_rt_id_t fid_dst_addr;    /* key field:  hdr.ethernet.dst_addr */
-static bf_rt_id_t aid_forward;     /* action ID:  forward               */
-static bf_rt_id_t aid_drop;        /* action ID:  drop                  */
-static bf_rt_id_t did_port;        /* data field: port (in forward)     */
-
-static void handle_signal(int sig) { (void)sig; running = 0; }
-
-/* --------------------------------------------------------------- */
-/*  MAC parsing                                                     */
-/* --------------------------------------------------------------- */
-
-static int parse_mac(const char *str, uint8_t mac[6])
+static void handle_signal(int sig)
 {
-    unsigned int m[6];
-    if (sscanf(str, "%x:%x:%x:%x:%x:%x",
-               &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6)
-        return -1;
-    for (int i = 0; i < 6; i++)
-        mac[i] = (uint8_t)m[i];
-    return 0;
+    (void)sig;
+    running = 0;
 }
 
-/* --------------------------------------------------------------- */
-/*  BF Runtime initialisation                                       */
-/* --------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/*  Switch agent TCP connection                                        */
+/* ------------------------------------------------------------------ */
 
-static int bfrt_setup(void)
+typedef struct {
+    int  sockfd;       /* -1 = log-only mode (no agent) */
+    char host[256];
+    char port[16];
+} switch_conn;
+
+static int switch_conn_open(switch_conn *sc, const char *hostport)
 {
-    bf_status_t rc;
+    sc->sockfd = -1;
+    if (!hostport) return 0;   /* log-only mode */
 
-    /* Create a session. */
-    rc = bf_rt_session_create(&session);
-    if (rc != BF_SUCCESS) {
-        fprintf(stderr, "bf_rt_session_create failed: %d\n", rc);
+    /* Parse host:port. */
+    const char *colon = strrchr(hostport, ':');
+    if (!colon) {
+        fprintf(stderr, "bad switch agent address (need host:port): %s\n",
+                hostport);
+        return -1;
+    }
+    size_t hlen = (size_t)(colon - hostport);
+    if (hlen >= sizeof(sc->host)) hlen = sizeof(sc->host) - 1;
+    memcpy(sc->host, hostport, hlen);
+    sc->host[hlen] = '\0';
+    strncpy(sc->port, colon + 1, sizeof(sc->port) - 1);
+
+    struct addrinfo hints = {0}, *res;
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int rc = getaddrinfo(sc->host, sc->port, &hints, &res);
+    if (rc != 0) {
+        fprintf(stderr, "getaddrinfo(%s:%s): %s\n",
+                sc->host, sc->port, gai_strerror(rc));
         return -1;
     }
 
-    /* Get the bfrt_info for our P4 program. */
-    rc = bf_rt_info_get(dev_tgt.dev_id, P4_PROG_NAME, &bfrt_info);
-    if (rc != BF_SUCCESS) {
-        fprintf(stderr, "bf_rt_info_get(%s) failed: %d\n",
-                P4_PROG_NAME, rc);
+    sc->sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sc->sockfd < 0) {
+        perror("socket (switch agent)");
+        freeaddrinfo(res);
         return -1;
     }
 
-    /* Look up the l2_forward table. */
-    rc = bf_rt_table_from_name_get(bfrt_info, TABLE_NAME, &l2_table);
-    if (rc != BF_SUCCESS) {
-        fprintf(stderr, "table lookup '%s' failed: %d\n", TABLE_NAME, rc);
+    int opt = 1;
+    setsockopt(sc->sockfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+    if (connect(sc->sockfd, res->ai_addr, res->ai_addrlen) < 0) {
+        perror("connect (switch agent)");
+        close(sc->sockfd);
+        sc->sockfd = -1;
+        freeaddrinfo(res);
         return -1;
     }
 
-    /* Resolve field/action IDs. */
-    rc = bf_rt_key_field_id_get(l2_table, "hdr.ethernet.dst_addr",
-                                &fid_dst_addr);
-    if (rc != BF_SUCCESS) {
-        fprintf(stderr, "key field lookup failed: %d\n", rc);
-        return -1;
-    }
-
-    rc = bf_rt_action_id_get(l2_table, ACTION_FWD, &aid_forward);
-    if (rc != BF_SUCCESS) {
-        fprintf(stderr, "action '%s' lookup failed: %d\n", ACTION_FWD, rc);
-        return -1;
-    }
-
-    rc = bf_rt_action_id_get(l2_table, ACTION_DROP, &aid_drop);
-    if (rc != BF_SUCCESS) {
-        fprintf(stderr, "action '%s' lookup failed: %d\n",
-                ACTION_DROP, rc);
-        return -1;
-    }
-
-    rc = bf_rt_data_field_id_with_action_get(l2_table, "port",
-                                             aid_forward, &did_port);
-    if (rc != BF_SUCCESS) {
-        fprintf(stderr, "data field 'port' lookup failed: %d\n", rc);
-        return -1;
-    }
-
+    freeaddrinfo(res);
+    printf("Connected to switch agent at %s:%s\n", sc->host, sc->port);
     return 0;
-}
-
-/* --------------------------------------------------------------- */
-/*  Table operations                                                */
-/* --------------------------------------------------------------- */
-
-static int add_l2_entry(const uint8_t mac[6], uint32_t port)
-{
-    bf_status_t rc;
-
-    bf_rt_table_key_hdl *key = NULL;
-    bf_rt_table_data_hdl *data = NULL;
-
-    rc = bf_rt_table_key_allocate(l2_table, &key);
-    if (rc != BF_SUCCESS) return -1;
-
-    rc = bf_rt_table_data_allocate_with_action(l2_table, aid_forward,
-                                               &data);
-    if (rc != BF_SUCCESS) goto err_key;
-
-    /* Set key: dst_addr (6 bytes, network order). */
-    rc = bf_rt_key_field_set_value_ptr(key, fid_dst_addr, mac, 6);
-    if (rc != BF_SUCCESS) goto err_data;
-
-    /* Set data: egress port. */
-    rc = bf_rt_data_field_set_value(data, did_port, (uint64_t)port);
-    if (rc != BF_SUCCESS) goto err_data;
-
-    rc = bf_rt_table_entry_add(l2_table, session, &dev_tgt, 0,
-                               key, data);
-    if (rc != BF_SUCCESS) {
-        fprintf(stderr, "entry_add failed: %d\n", rc);
-        goto err_data;
-    }
-
-    bf_rt_table_data_deallocate(data);
-    bf_rt_table_key_deallocate(key);
-    return 0;
-
-err_data:
-    bf_rt_table_data_deallocate(data);
-err_key:
-    bf_rt_table_key_deallocate(key);
-    return -1;
-}
-
-static int mod_l2_entry(const uint8_t mac[6], uint32_t port)
-{
-    bf_status_t rc;
-
-    bf_rt_table_key_hdl *key = NULL;
-    bf_rt_table_data_hdl *data = NULL;
-
-    rc = bf_rt_table_key_allocate(l2_table, &key);
-    if (rc != BF_SUCCESS) return -1;
-
-    rc = bf_rt_table_data_allocate_with_action(l2_table, aid_forward,
-                                               &data);
-    if (rc != BF_SUCCESS) goto err_key;
-
-    rc = bf_rt_key_field_set_value_ptr(key, fid_dst_addr, mac, 6);
-    if (rc != BF_SUCCESS) goto err_data;
-
-    rc = bf_rt_data_field_set_value(data, did_port, (uint64_t)port);
-    if (rc != BF_SUCCESS) goto err_data;
-
-    rc = bf_rt_table_entry_mod(l2_table, session, &dev_tgt, 0,
-                               key, data);
-    if (rc != BF_SUCCESS) {
-        fprintf(stderr, "entry_mod failed: %d\n", rc);
-        goto err_data;
-    }
-
-    bf_rt_table_data_deallocate(data);
-    bf_rt_table_key_deallocate(key);
-    return 0;
-
-err_data:
-    bf_rt_table_data_deallocate(data);
-err_key:
-    bf_rt_table_key_deallocate(key);
-    return -1;
-}
-
-static int del_l2_entry(const uint8_t mac[6])
-{
-    bf_status_t rc;
-
-    bf_rt_table_key_hdl *key = NULL;
-
-    rc = bf_rt_table_key_allocate(l2_table, &key);
-    if (rc != BF_SUCCESS) return -1;
-
-    rc = bf_rt_key_field_set_value_ptr(key, fid_dst_addr, mac, 6);
-    if (rc != BF_SUCCESS) goto err;
-
-    rc = bf_rt_table_entry_del(l2_table, session, &dev_tgt, 0, key);
-    if (rc != BF_SUCCESS) {
-        fprintf(stderr, "entry_del failed: %d\n", rc);
-        goto err;
-    }
-
-    bf_rt_table_key_deallocate(key);
-    return 0;
-
-err:
-    bf_rt_table_key_deallocate(key);
-    return -1;
 }
 
 /*
- * update_l2_entry — Single entry point for fail-over integration.
- *
- * When the DiDAQt controller API detects a failure and decides to
- * reroute traffic, it calls this function with the old and new
- * forwarding entries.
- *
- *   old_mac/old_port: the current (failed) path's destination
- *   new_mac/new_port: the replacement path's destination
+ * Send a command, read the one-line response.
+ * Returns the response latency in microseconds, or -1 on error.
  */
-int update_l2_entry(const uint8_t old_mac[6],
-                    const uint8_t new_mac[6], uint32_t new_port)
+static long switch_conn_send(switch_conn *sc, const char *cmd)
 {
-    int rc;
+    if (sc->sockfd < 0) return 0;
 
-    /* Remove the failed path. */
-    rc = del_l2_entry(old_mac);
-    if (rc != 0)
-        fprintf(stderr, "warning: del old entry failed\n");
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    /* Install the replacement path. */
-    rc = add_l2_entry(new_mac, new_port);
-    if (rc != 0) {
-        fprintf(stderr, "error: add new entry failed\n");
+    size_t len = strlen(cmd);
+    if (send(sc->sockfd, cmd, len, 0) != (ssize_t)len)
+        return -1;
+
+    /* Read response line. */
+    char resp[256];
+    int pos = 0;
+    while (pos < (int)sizeof(resp) - 1) {
+        ssize_t n = recv(sc->sockfd, resp + pos, 1, 0);
+        if (n <= 0) return -1;
+        if (resp[pos] == '\n') break;
+        pos++;
+    }
+    resp[pos] = '\0';
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long us = (t1.tv_sec - t0.tv_sec) * 1000000L
+            + (t1.tv_nsec - t0.tv_nsec) / 1000;
+
+    return us;
+}
+
+static void switch_conn_close(switch_conn *sc)
+{
+    if (sc->sockfd >= 0) {
+        close(sc->sockfd);
+        sc->sockfd = -1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Switch handler                                                     */
+/* ------------------------------------------------------------------ */
+
+static int switch_handler(uint64_t sender_id,
+                          int cur_in, int cur_out,
+                          int new_in, int new_out,
+                          void *user_data)
+{
+    switch_conn *sc = (switch_conn *)user_data;
+
+    if (sc->sockfd < 0) {
+        /* Log-only mode. */
+        printf("  SWITCH UPDATE (log): sender_id=%lu  "
+               "(%d,%d) -> (%d,%d)\n",
+               (unsigned long)sender_id,
+               cur_in, cur_out, new_in, new_out);
+        return 0;
+    }
+
+    /* Send real command to the switch agent. */
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "UPDATE %lu %d %d %d %d\n",
+             (unsigned long)sender_id,
+             cur_in, cur_out, new_in, new_out);
+
+    long us = switch_conn_send(sc, cmd);
+    if (us < 0) {
+        fprintf(stderr, "  SWITCH UPDATE FAILED: send error\n");
         return -1;
     }
 
-    bf_rt_session_complete_operations(session);
+    printf("  SWITCH UPDATE: sender_id=%lu  (%d,%d) -> (%d,%d)  "
+           "rtt=%ld us\n",
+           (unsigned long)sender_id,
+           cur_in, cur_out, new_in, new_out, us);
     return 0;
 }
 
-/* --------------------------------------------------------------- */
-/*  Initial configuration from file                                 */
-/* --------------------------------------------------------------- */
-
-static int load_config(const char *path)
-{
-    FILE *fp = fopen(path, "r");
-    if (!fp) {
-        perror(path);
-        return -1;
-    }
-
-    char line[256];
-    int count = 0;
-
-    while (fgets(line, sizeof(line), fp)) {
-        /* Skip comments and blank lines. */
-        if (line[0] == '#' || line[0] == '\n')
-            continue;
-
-        char mac_str[32];
-        uint32_t port;
-        if (sscanf(line, "%31s %u", mac_str, &port) != 2) {
-            fprintf(stderr, "bad config line: %s", line);
-            continue;
-        }
-
-        uint8_t mac[6];
-        if (parse_mac(mac_str, mac) != 0) {
-            fprintf(stderr, "bad MAC in config: %s\n", mac_str);
-            continue;
-        }
-
-        if (add_l2_entry(mac, port) != 0) {
-            fprintf(stderr, "failed to add entry: %s -> %u\n",
-                    mac_str, port);
-        } else {
-            printf("  %s -> port %u\n", mac_str, port);
-            count++;
-        }
-    }
-
-    fclose(fp);
-
-    /* Push all updates to hardware. */
-    bf_rt_session_complete_operations(session);
-
-    printf("loaded %d forwarding entries\n", count);
-    return 0;
-}
-
-/* --------------------------------------------------------------- */
-/*  Runtime command listener                                        */
-/* --------------------------------------------------------------- */
-
-static void handle_command(const char *cmd)
-{
-    char op[8], mac_str[32];
-    uint32_t port;
-    uint8_t mac[6];
-
-    if (sscanf(cmd, "%7s %31s %u", op, mac_str, &port) >= 2) {
-        if (parse_mac(mac_str, mac) != 0) {
-            fprintf(stderr, "bad MAC: %s\n", mac_str);
-            return;
-        }
-
-        if (strcmp(op, "ADD") == 0) {
-            if (add_l2_entry(mac, port) == 0)
-                printf("added %s -> port %u\n", mac_str, port);
-        } else if (strcmp(op, "MOD") == 0) {
-            if (mod_l2_entry(mac, port) == 0)
-                printf("modified %s -> port %u\n", mac_str, port);
-        } else if (strcmp(op, "DEL") == 0) {
-            if (del_l2_entry(mac) == 0)
-                printf("deleted %s\n", mac_str);
-        } else {
-            fprintf(stderr, "unknown command: %s\n", op);
-        }
-
-        bf_rt_session_complete_operations(session);
-    }
-}
-
-static void *cmd_listener(void *arg)
-{
-    (void)arg;
-
-    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenfd < 0) { perror("socket"); return NULL; }
-
-    int opt = 1;
-    setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(CMD_PORT);
-
-    if (bind(listenfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind cmd");
-        close(listenfd);
-        return NULL;
-    }
-    listen(listenfd, 4);
-    printf("command listener on port %d\n", CMD_PORT);
-
-    while (running) {
-        int connfd = accept(listenfd, NULL, NULL);
-        if (connfd < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-
-        char buf[CMD_BUF_LEN];
-        ssize_t n;
-        while ((n = recv(connfd, buf, sizeof(buf) - 1, 0)) > 0) {
-            buf[n] = '\0';
-            /* Process each newline-delimited command. */
-            char *saveptr;
-            char *line = strtok_r(buf, "\n", &saveptr);
-            while (line) {
-                handle_command(line);
-                line = strtok_r(NULL, "\n", &saveptr);
-            }
-        }
-        close(connfd);
-    }
-
-    close(listenfd);
-    return NULL;
-}
-
-/* --------------------------------------------------------------- */
-/*  Main                                                            */
-/* --------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/*  Main                                                               */
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <config_file>\n", argv[0]);
+    if (argc < 3 || argc > 4) {
+        fprintf(stderr,
+                "Usage: %s <topology.yaml> <heartbeat_port> "
+                "[switch_agent_host:port]\n", argv[0]);
         return 1;
     }
+
+    const char *topo_path  = argv[1];
+    uint16_t hb_port       = (uint16_t)atoi(argv[2]);
+    const char *agent_addr = (argc == 4) ? argv[3] : NULL;
 
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
-    /* Initialise BF Runtime and resolve table/field handles. */
-    if (bfrt_setup() != 0) {
-        fprintf(stderr, "BF Runtime setup failed\n");
-        return 1;
-    }
-    printf("BF Runtime connected to %s\n", P4_PROG_NAME);
-
-    /* Load initial forwarding entries. */
-    printf("loading config: %s\n", argv[1]);
-    if (load_config(argv[1]) != 0) {
-        fprintf(stderr, "config load failed\n");
+    /* ---- Connect to switch agent (if specified) ---- */
+    switch_conn sc;
+    if (switch_conn_open(&sc, agent_addr) < 0) {
+        fprintf(stderr, "Could not connect to switch agent\n");
         return 1;
     }
 
-    /* Start the command listener for runtime updates. */
-    pthread_t cmd_thread;
-    pthread_create(&cmd_thread, NULL, cmd_listener, NULL);
+    if (sc.sockfd >= 0) {
+        /* Verify with PING. */
+        long us = switch_conn_send(&sc, "PING\n");
+        if (us < 0) {
+            fprintf(stderr, "Switch agent PING failed\n");
+            switch_conn_close(&sc);
+            return 1;
+        }
+        printf("Switch agent PING OK (rtt=%ld us)\n", us);
+    } else {
+        printf("Running in log-only mode (no switch agent)\n");
+    }
 
-    /* Main thread waits for termination. */
-    while (running)
-        sleep(1);
+    /* ---- Initialise controller context ---- */
+    didaqt_ctrl_ctx *ctx = NULL;
+    if (didaqt_ctrl_init_ctx(&ctx) != DIDAQT_OK) {
+        fprintf(stderr, "didaqt_ctrl_init_ctx failed\n");
+        switch_conn_close(&sc);
+        return 1;
+    }
 
-    printf("controller shutting down\n");
-    pthread_cancel(cmd_thread);
-    pthread_join(cmd_thread, NULL);
+    /* ---- Process topology ---- */
+    printf("Loading topology: %s\n", topo_path);
+    if (didaqt_ctrl_process_topology(topo_path, ctx) != DIDAQT_OK) {
+        fprintf(stderr, "didaqt_ctrl_process_topology failed\n");
+        didaqt_ctrl_destroy(ctx);
+        switch_conn_close(&sc);
+        return 1;
+    }
 
-    bf_rt_session_destroy(session);
+    /* Print initial path state. */
+    didaqt_path_info *paths = NULL;
+    int path_count = 0;
+    didaqt_ctrl_get_path_statuses(ctx, &paths, &path_count);
+    printf("\nInitial paths (%d total):\n", path_count);
+    for (int i = 0; i < path_count; i++) {
+        const char *st;
+        switch (paths[i].status) {
+        case DIDAQT_PATH_USED:        st = "USED";        break;
+        case DIDAQT_PATH_AVAILABLE:   st = "AVAILABLE";   break;
+        case DIDAQT_PATH_TEMP_FAILED: st = "TEMP_FAILED"; break;
+        case DIDAQT_PATH_FAILED:      st = "FAILED";      break;
+        default:                      st = "?";            break;
+        }
+        printf("  [%d] sender=%s -> receiver=%s  %s\n",
+               paths[i].path_id, paths[i].sender_name,
+               paths[i].receiver_name, st);
+    }
+    free(paths);
+
+    /* ---- Register switch handler ---- */
+    didaqt_ctrl_register_handler(ctx, "tofino2", switch_handler, &sc);
+    printf("\nSwitch handler registered for type 'tofino2'\n");
+
+    /* ---- Open heartbeat listener (IPv6 dual-stack) ---- */
+    int sockfd = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("socket");
+        didaqt_ctrl_destroy(ctx);
+        switch_conn_close(&sc);
+        return 1;
+    }
+
+    int opt = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    int v6only = 0;
+    setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+
+    struct sockaddr_in6 addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr   = in6addr_any;
+    addr.sin6_port   = htons(hb_port);
+
+    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(sockfd);
+        didaqt_ctrl_destroy(ctx);
+        switch_conn_close(&sc);
+        return 1;
+    }
+
+    printf("Controller listening for heartbeats on UDP port %u\n\n",
+           hb_port);
+
+    /* ---- Main loop ---- */
+    uint8_t buf[6 + DIDAQT_MAX_SENDERS * 4];
+    uint64_t hb_count = 0;
+
+    while (running) {
+        struct sockaddr_storage src;
+        socklen_t src_len = sizeof(src);
+
+        ssize_t n = recvfrom(sockfd, buf, sizeof(buf), 0,
+                             (struct sockaddr *)&src, &src_len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("recvfrom");
+            break;
+        }
+        if (n < 6) continue;
+
+        hb_count++;
+
+        uint32_t rid;
+        uint16_t scnt;
+        memcpy(&rid,  buf,     4); rid  = ntohl(rid);
+        memcpy(&scnt, buf + 4, 2); scnt = ntohs(scnt);
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        int rc = didaqt_ctrl_process_heartbeat(buf, (size_t)n, ctx);
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long proc_us = (t1.tv_sec - t0.tv_sec) * 1000000L
+                     + (t1.tv_nsec - t0.tv_nsec) / 1000;
+
+        printf("[HB #%lu] receiver_id=%u senders=%u  proc=%ld us\n",
+               (unsigned long)hb_count, rid, scnt, proc_us);
+
+        if (rc != DIDAQT_OK) {
+            printf("  (heartbeat processing error: rc=%d)\n", rc);
+        }
+    }
+
+    close(sockfd);
+    switch_conn_close(&sc);
+    didaqt_ctrl_destroy(ctx);
+    printf("\nController stopped after %lu heartbeats\n",
+           (unsigned long)hb_count);
     return 0;
 }
