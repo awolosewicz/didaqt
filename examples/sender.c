@@ -14,11 +14,16 @@
  * The sender is a "black box" from DiDAQt's perspective (requirement
  * R2) — it has no awareness of the fault-detection framework.
  *
+ * Flags:
+ *   -f    Faulty mode: alternate between valid and invalid magic
+ *         values every packet, simulating intermittent data corruption.
+ *
  * Usage:
- *   ./sender <interface> <dst_mac> <sender_id> [vlan_id]
+ *   ./sender [-f] <interface> <dst_mac> <sender_id> [vlan_id]
  *
  * Example:
  *   ./sender eth0 00:11:22:33:44:55 1 100
+ *   ./sender -f eth0 00:11:22:33:44:55 1 100
  *
  * Build (on a Linux host):
  *   gcc -O2 -Wall -o sender sender.c
@@ -54,7 +59,8 @@
 
 /* 8-byte magic value written at the start of every UDP payload.
  * Receivers validate this to confirm data integrity.             */
-#define SENDER_MAGIC   0xD1DA0754CAFE00AAULL   /* "DiDAQt.CAFE.00AA" */
+#define SENDER_MAGIC       0xD1DA0754CAFE00AAULL   /* "DiDAQt.CAFE.00AA" */
+#define SENDER_MAGIC_BAD   0xDEADBEEFDEADBEEFULL   /* intentionally wrong */
 
 static volatile int running = 1;
 
@@ -166,9 +172,17 @@ static int build_frame(uint8_t *frame,
 
 int main(int argc, char **argv)
 {
+    /* Parse optional -f flag. */
+    int faulty = 0;
+    if (argc > 1 && strcmp(argv[1], "-f") == 0) {
+        faulty = 1;
+        argv++;
+        argc--;
+    }
+
     if (argc < 4 || argc > 5) {
         fprintf(stderr,
-                "Usage: %s <interface> <dst_mac> <sender_id> [vlan_id]\n",
+                "Usage: %s [-f] <interface> <dst_mac> <sender_id> [vlan_id]\n",
                 argv[0]);
         return 1;
     }
@@ -224,15 +238,27 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Build the frame template (reused for every send). */
-    uint8_t frame[FRAME_LEN];
-    build_frame(frame, src_mac, dst_mac, sender_id, vlan_id);
+    /* Build frame templates. */
+    uint8_t frame_good[FRAME_LEN];
+    uint8_t frame_bad[FRAME_LEN];
+    build_frame(frame_good, src_mac, dst_mac, sender_id, vlan_id);
+
+    if (faulty) {
+        /* Build a second template with an invalid magic value. */
+        memcpy(frame_bad, frame_good, FRAME_LEN);
+        int use_vlan = (vlan_id > 0);
+        int l2_len   = ETH_HDR_LEN + (use_vlan ? VLAN_HDR_LEN : 0);
+        int magic_off = l2_len + IP_HDR_LEN + UDP_HDR_LEN;
+        uint64_t bad = htobe64(SENDER_MAGIC_BAD);
+        memcpy(frame_bad + magic_off, &bad, 8);
+    }
 
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
-    printf("sender %u: sending %d-byte frames on %s -> %s (vlan %u)\n",
-           sender_id, FRAME_LEN, ifname, dst_mac_s, vlan_id);
+    printf("sender %u: sending %d-byte frames on %s -> %s (vlan %u)%s\n",
+           sender_id, FRAME_LEN, ifname, dst_mac_s, vlan_id,
+           faulty ? " [FAULTY]" : "");
 
     /* --- Transmit loop --- */
     uint64_t tx_count = 0;
@@ -240,6 +266,8 @@ int main(int argc, char **argv)
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     while (running) {
+        uint8_t *frame = (faulty && (tx_count & 1))
+                       ? frame_bad : frame_good;
         ssize_t n = send(sockfd, frame, FRAME_LEN, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
