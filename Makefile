@@ -33,7 +33,7 @@ $(BUILD_DIR)/sender: examples/sender.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -O2 -o $@ $<
 
 $(BUILD_DIR)/receiver: examples/receiver.c $(LIB) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -O2 -o $@ $< -L$(BUILD_DIR) -ldidaqt -lpthread
+	$(CC) $(CFLAGS) -O2 -o $@ $< -L$(BUILD_DIR) -ldidaqt -lyaml -lpthread
 
 $(BUILD_DIR)/heartbeat_monitor: artifact/heartbeat_monitor.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -O2 -o $@ $<
@@ -42,7 +42,7 @@ $(BUILD_DIR)/heartbeat_monitor: artifact/heartbeat_monitor.c | $(BUILD_DIR)
 controller: examples/controller.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -O2 -I$(SDE_INSTALL)/include \
 		-o $(BUILD_DIR)/controller $< \
-		-L$(SDE_INSTALL)/lib -lbf_switchd_lib -lbfrt -lpthread
+		-L$(SDE_INSTALL)/lib -lbf_switchd_lib -lbfrt -lyaml -lpthread
 
 clean:
 	rm -rf $(BUILD_DIR)
