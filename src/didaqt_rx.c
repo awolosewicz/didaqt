@@ -23,6 +23,13 @@ struct didaqt_rx_ctx {
     /* Scheduled sender IDs for the current interval. */
     uint32_t  senders[DIDAQT_MAX_SENDERS];
     int       sender_count;
+
+    /* Blocked sender IDs for the current interval.
+     * Any s_id in this set is excluded from the heartbeat and
+     * cannot be re-added by schedule_heartbeat until the next interval. */
+    uint32_t  blocked[DIDAQT_MAX_SENDERS];
+    int       blocked_count;
+
     pthread_mutex_t lock;
 
     /* Background heartbeat thread. */
@@ -85,12 +92,13 @@ static void *heartbeat_loop(void *arg)
     while (ctx->running) {
         nanosleep(&ts, NULL);
 
-        /* Snapshot and clear the scheduled set. */
+        /* Snapshot and clear the scheduled and blocked sets. */
         pthread_mutex_lock(&ctx->lock);
         snap_count = ctx->sender_count;
         if (snap_count > 0)
             memcpy(snap, ctx->senders, snap_count * sizeof(uint32_t));
-        ctx->sender_count = 0;
+        ctx->sender_count  = 0;
+        ctx->blocked_count = 0;
         pthread_mutex_unlock(&ctx->lock);
 
         /* Always send a heartbeat — an empty one signals that the
@@ -204,6 +212,14 @@ int schedule_heartbeat(uint32_t s_id, didaqt_rx_ctx *ctx)
 
     pthread_mutex_lock(&ctx->lock);
 
+    /* If this sender is blocked for the current interval, ignore. */
+    for (int i = 0; i < ctx->blocked_count; i++) {
+        if (ctx->blocked[i] == s_id) {
+            pthread_mutex_unlock(&ctx->lock);
+            return DIDAQT_OK;
+        }
+    }
+
     /* Check if already scheduled to avoid duplicates. */
     for (int i = 0; i < ctx->sender_count; i++) {
         if (ctx->senders[i] == s_id) {
@@ -218,6 +234,38 @@ int schedule_heartbeat(uint32_t s_id, didaqt_rx_ctx *ctx)
     }
 
     ctx->senders[ctx->sender_count++] = s_id;
+
+    pthread_mutex_unlock(&ctx->lock);
+    return DIDAQT_OK;
+}
+
+int deschedule_heartbeat(uint32_t s_id, didaqt_rx_ctx *ctx)
+{
+    if (!ctx)
+        return DIDAQT_ERR;
+
+    pthread_mutex_lock(&ctx->lock);
+
+    /* Remove from the scheduled set if present. */
+    for (int i = 0; i < ctx->sender_count; i++) {
+        if (ctx->senders[i] == s_id) {
+            ctx->senders[i] = ctx->senders[ctx->sender_count - 1];
+            ctx->sender_count--;
+            break;
+        }
+    }
+
+    /* Add to the blocked set so schedule_heartbeat calls for this
+     * sender are ignored for the remainder of the interval. */
+    int already_blocked = 0;
+    for (int i = 0; i < ctx->blocked_count; i++) {
+        if (ctx->blocked[i] == s_id) {
+            already_blocked = 1;
+            break;
+        }
+    }
+    if (!already_blocked && ctx->blocked_count < DIDAQT_MAX_SENDERS)
+        ctx->blocked[ctx->blocked_count++] = s_id;
 
     pthread_mutex_unlock(&ctx->lock);
     return DIDAQT_OK;

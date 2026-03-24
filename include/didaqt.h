@@ -90,6 +90,20 @@ int didaqt_rx_start(didaqt_rx_ctx *ctx);
 int schedule_heartbeat(uint32_t s_id, didaqt_rx_ctx *ctx);
 
 /*
+ * deschedule_heartbeat — Mark a sender connection as unhealthy.
+ *
+ * Removes s_id from the scheduled set for the current heartbeat
+ * interval AND blocks any subsequent schedule_heartbeat() calls
+ * for s_id until the next interval.  This guarantees that even a
+ * single bad packet within an interval prevents that sender from
+ * appearing in the heartbeat, regardless of how many good packets
+ * arrive before or after.
+ *
+ * The block is automatically cleared when the heartbeat fires.
+ */
+int deschedule_heartbeat(uint32_t s_id, didaqt_rx_ctx *ctx);
+
+/*
  * didaqt_rx_stop — Stop the heartbeat thread and release resources.
  *
  * Blocks until the background thread exits.  After this call the

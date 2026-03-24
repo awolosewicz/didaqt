@@ -201,10 +201,12 @@ int main(int argc, char **argv)
         memcpy(&magic, frame + magic_off, sizeof(magic));
         magic = be64toh(magic);
 
+        uint32_t s_id = sender_id_from_frame(frame, l2len);
         if (magic == SENDER_MAGIC) {
-            uint32_t s_id = sender_id_from_frame(frame, l2len);
             schedule_heartbeat(s_id, ctx);
             rx_valid++;
+        } else {
+            deschedule_heartbeat(s_id, ctx);
         }
 
         if ((rx_count & 0xFFFFF) == 0) {
