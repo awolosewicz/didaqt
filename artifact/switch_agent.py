@@ -41,7 +41,7 @@ if os.path.exists(STOP_FILE):
     os.unlink(STOP_FILE)
 
 # ---- Discover port mapping (logical name -> dev_port) ----
-port_dump = bfrt.port.port.dump(return_ents=True, from_hw=True)
+port_dump = bfrt.port.port.dump(return_ents=True)
 port_map = {}
 if port_dump:
     for ent in port_dump:
@@ -79,10 +79,13 @@ def handle_update(sender_id, cur_in, cur_out, new_in, new_out):
                 port_val = ent.data.get('port') or ent.data.get(b'port')
                 if port_val == dev_cur_out:
                     dst = ent.key.get('dst_addr') or ent.key.get(b'dst_addr')
-                    l2_fwd.mod(
+                    vlan = ent.data.get('vlan_id', ent.data.get(b'vlan_id', 0))
+                    # bfrt_python has no .mod(); delete + re-add.
+                    l2_fwd.delete(dst_addr=dst)
+                    l2_fwd.add_with_forward(
                         dst_addr=dst,
                         port=dev_new_out,
-                        vlan_id=ent.data.get('vlan_id', ent.data.get(b'vlan_id', 0))
+                        vlan_id=vlan
                     )
                     modified = True
                     break
