@@ -1,23 +1,44 @@
 """
 switch_agent.py — Runs inside bfrt_python on the Tofino switch.
 
-Listens for TCP commands from the DiDAQt controller and translates
-them into bfrt table operations on the l2_forward table.
+Listens for ICMPv6 echo requests from the DiDAQt controller and
+translates them into bfrt table operations on the l2_forward table.
+Uses ICMPv6 because FABRIC's management plane allows ICMP but blocks
+arbitrary TCP/UDP between nodes.
 
-Protocol (newline-delimited):
-  Controller sends:  UPDATE <sender_id> <cur_in> <cur_out> <new_in> <new_out>
-  Agent responds:    OK <elapsed_us>
-                     ERR <message>
+Protocol:
+  Controller sends ICMPv6 echo request (type 128) with:
+    - Identifier: 0xDDAA
+    - Payload: command string (e.g., "UPDATE 1 1 3 1 4")
+  Agent sends ICMPv6 echo reply (type 129) with:
+    - Same identifier and sequence
+    - Payload: response (e.g., "OK 1234" or "PONG")
 
-Run with:
-  run_bfshell.sh --no-status-srv -b /path/to/switch_agent.py
+The kernel also auto-replies with the original payload echoed back;
+the controller distinguishes agent replies by payload prefix.
 
-The agent runs indefinitely, accepting multiple sequential connections.
+To stop the agent (since ctrl-c is intercepted by switchd):
+  - Send a QUIT command via ICMPv6 from the controller
+  - Or: touch /tmp/switch_agent_stop
+
+Run with (inside bfshell session):
+  bfrt_python /tmp/switch_agent.py
+
+Requires root (raw sockets).
 """
 import socket
+import struct
 import time
+import os
 
-AGENT_PORT = 9200
+ICMP6_ECHO_REQUEST = 128
+ICMP6_ECHO_REPLY = 129
+DIDAQT_ICMP_ID = 0xDDAA
+STOP_FILE = '/tmp/switch_agent_stop'
+
+# Clean up stale stop file from previous runs.
+if os.path.exists(STOP_FILE):
+    os.unlink(STOP_FILE)
 
 # ---- Discover port mapping (logical name -> dev_port) ----
 port_dump = bfrt.port.port.dump(return_ents=True, from_hw=True)
@@ -41,13 +62,7 @@ def resolve_port(logical):
     return port_map.get(str(logical))
 
 def handle_update(sender_id, cur_in, cur_out, new_in, new_out):
-    """
-    Apply a forwarding table change for a failover.
-
-    For our L2 forwarding table (keyed by dst_mac), this performs
-    the table modification needed to reroute traffic.  The exact
-    operation depends on which ports changed.
-    """
+    """Apply a forwarding table change for a failover."""
     t0 = time.monotonic()
 
     dev_new_out = resolve_port(new_out)
@@ -56,18 +71,13 @@ def handle_update(sender_id, cur_in, cur_out, new_in, new_out):
     if dev_new_out is None:
         return False, "unknown new egress port"
 
-    # For the evaluation, perform a table read+modify cycle to
-    # measure real hardware latency.  In a full implementation this
-    # would do the specific add/modify/delete operations.
     try:
-        # Read current entries to find the one using the old egress.
         entries = l2_fwd.dump(return_ents=True, from_hw=True)
         modified = False
         if entries and dev_cur_out is not None:
             for ent in entries:
                 port_val = ent.data.get('port') or ent.data.get(b'port')
                 if port_val == dev_cur_out:
-                    # Modify this entry to point to the new egress.
                     dst = ent.key.get('dst_addr') or ent.key.get(b'dst_addr')
                     l2_fwd.mod(
                         dst_addr=dst,
@@ -88,50 +98,83 @@ def handle_update(sender_id, cur_in, cur_out, new_in, new_out):
     except Exception as e:
         return False, str(e)
 
-# ---- TCP server ----
-srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-try:
-    srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-except Exception:
-    pass
-srv.bind(('::', AGENT_PORT))
-srv.listen(4)
-print(f"switch_agent: listening on TCP port {AGENT_PORT}")
+def handle_command(cmd):
+    """Process a command string, return (response_string, should_quit)."""
+    parts = cmd.split()
+    if not parts:
+        return "ERR empty", False
 
-while True:
-    conn, addr = srv.accept()
-    print(f"switch_agent: connection from {addr}")
-    buf = b''
+    if parts[0] == 'PING':
+        return 'PONG', False
+
+    if parts[0] == 'QUIT':
+        return 'OK bye', True
+
+    if parts[0] == 'UPDATE' and len(parts) == 6:
+        sid    = int(parts[1])
+        ci     = int(parts[2])
+        co     = int(parts[3])
+        ni     = int(parts[4])
+        no     = int(parts[5])
+        ok, msg = handle_update(sid, ci, co, ni, no)
+        return (f'OK {msg}' if ok else f'ERR {msg}'), False
+
+    return 'ERR bad command', False
+
+# ---- ICMPv6 raw socket ----
+sock = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+sock.settimeout(5.0)  # check stop file periodically
+
+print(f"switch_agent: listening for ICMPv6 echo requests (id=0x{DIDAQT_ICMP_ID:04X})")
+print(f"switch_agent: send QUIT command or 'touch {STOP_FILE}' to exit")
+
+agent_running = True
+while agent_running:
+    # Check stop file
+    if os.path.exists(STOP_FILE):
+        print("switch_agent: stop file detected, exiting")
+        break
+
     try:
-        while True:
-            data = conn.recv(4096)
-            if not data:
-                break
-            buf += data
-            while b'\n' in buf:
-                line, buf = buf.split(b'\n', 1)
-                cmd = line.decode().strip()
-                if not cmd:
-                    continue
-                parts = cmd.split()
-                if parts[0] == 'UPDATE' and len(parts) == 6:
-                    sid   = int(parts[1])
-                    ci    = int(parts[2])
-                    co    = int(parts[3])
-                    ni    = int(parts[4])
-                    no    = int(parts[5])
-                    ok, msg = handle_update(sid, ci, co, ni, no)
-                    if ok:
-                        conn.sendall(f'OK {msg}\n'.encode())
-                    else:
-                        conn.sendall(f'ERR {msg}\n'.encode())
-                elif parts[0] == 'PING':
-                    conn.sendall(b'PONG\n')
-                else:
-                    conn.sendall(b'ERR bad command\n')
-    except Exception as e:
-        print(f"switch_agent: connection error: {e}")
-    finally:
-        conn.close()
-        print(f"switch_agent: connection closed")
+        data, addr = sock.recvfrom(4096)
+    except socket.timeout:
+        continue
+    except Exception:
+        continue
+
+    if len(data) < 8:
+        continue
+
+    # Parse ICMPv6 header
+    icmp_type = data[0]
+    if icmp_type != ICMP6_ECHO_REQUEST:
+        continue
+
+    ident = struct.unpack('!H', data[4:6])[0]
+    if ident != DIDAQT_ICMP_ID:
+        continue
+
+    seq = struct.unpack('!H', data[6:8])[0]
+    payload = data[8:].decode('utf-8', errors='replace').strip()
+
+    print(f"  recv: seq={seq} cmd='{payload}' from {addr[0]}")
+
+    # Process command
+    response, quit_flag = handle_command(payload)
+
+    # Build echo reply: type=129, code=0, cksum=0 (kernel fills),
+    # same id and seq, response as payload.
+    reply = struct.pack('!BBHHH',
+                        ICMP6_ECHO_REPLY, 0, 0,
+                        DIDAQT_ICMP_ID, seq)
+    reply += response.encode('utf-8')
+
+    sock.sendto(reply, addr)
+    print(f"  sent: seq={seq} resp='{response}' to {addr[0]}")
+
+    if quit_flag:
+        print("switch_agent: QUIT received, exiting")
+        agent_running = False
+
+sock.close()
+print("switch_agent: stopped")

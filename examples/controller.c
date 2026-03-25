@@ -6,18 +6,22 @@
  * runs the failover state machine.
  *
  * When a switch agent address is provided, failover actions are
- * sent as TCP commands to the agent running on the Tofino, and
- * the round-trip time is measured and printed.
+ * sent as ICMPv6 echo request/reply messages to the agent running
+ * on the Tofino, and the round-trip time is measured.  ICMPv6 is
+ * used because FABRIC's management plane allows ICMP but blocks
+ * arbitrary TCP/UDP between nodes.
  *
  * Usage:
- *   ./controller <topology.yaml> <heartbeat_port> [switch_agent_host:port]
+ *   ./controller <topology.yaml> <heartbeat_port> [switch_ipv6]
  *
  * Examples:
- *   ./controller topology.yaml 9000                     # log-only mode
- *   ./controller topology.yaml 9000 10.0.0.5:9200       # live switch updates
+ *   ./controller topology.yaml 9000                         # log-only
+ *   ./controller topology.yaml 9000 2001:db8::1             # live updates
  *
  * Build:
  *   make build/controller
+ *
+ * Requires: CAP_NET_RAW (run with sudo).
  */
 
 #define _GNU_SOURCE
@@ -33,7 +37,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
+#include <netinet/icmp6.h>
 #include <netdb.h>
 
 #include "didaqt.h"
@@ -47,98 +51,138 @@ static void handle_signal(int sig)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Switch agent TCP connection                                        */
+/*  ICMPv6 switch agent connection                                     */
 /* ------------------------------------------------------------------ */
 
+#define DIDAQT_ICMP_ID  0xDDAA
+
 typedef struct {
-    int  sockfd;       /* -1 = log-only mode (no agent) */
-    char host[256];
-    char port[16];
+    int                sockfd;    /* -1 = log-only mode */
+    struct sockaddr_in6 dest;
+    uint16_t           seq;
 } switch_conn;
 
-static int switch_conn_open(switch_conn *sc, const char *hostport)
+static int switch_conn_open(switch_conn *sc, const char *addr)
 {
+    memset(sc, 0, sizeof(*sc));
     sc->sockfd = -1;
-    if (!hostport) return 0;   /* log-only mode */
+    if (!addr) return 0;   /* log-only mode */
 
-    /* Parse host:port. */
-    const char *colon = strrchr(hostport, ':');
-    if (!colon) {
-        fprintf(stderr, "bad switch agent address (need host:port): %s\n",
-                hostport);
+    /* Resolve IPv6 address. */
+    if (inet_pton(AF_INET6, addr, &sc->dest.sin6_addr) != 1) {
+        fprintf(stderr, "bad IPv6 address: %s\n", addr);
         return -1;
     }
-    size_t hlen = (size_t)(colon - hostport);
-    if (hlen >= sizeof(sc->host)) hlen = sizeof(sc->host) - 1;
-    memcpy(sc->host, hostport, hlen);
-    sc->host[hlen] = '\0';
-    strncpy(sc->port, colon + 1, sizeof(sc->port) - 1);
+    sc->dest.sin6_family = AF_INET6;
 
-    struct addrinfo hints = {0}, *res;
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    int rc = getaddrinfo(sc->host, sc->port, &hints, &res);
-    if (rc != 0) {
-        fprintf(stderr, "getaddrinfo(%s:%s): %s\n",
-                sc->host, sc->port, gai_strerror(rc));
-        return -1;
-    }
-
-    sc->sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    /* Open raw ICMPv6 socket. */
+    sc->sockfd = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
     if (sc->sockfd < 0) {
-        perror("socket (switch agent)");
-        freeaddrinfo(res);
+        perror("socket (ICMPv6 raw)");
         return -1;
     }
 
-    int opt = 1;
-    setsockopt(sc->sockfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    /* Filter: only receive echo replies. */
+    struct icmp6_filter filt;
+    ICMP6_FILTER_SETBLOCKALL(&filt);
+    ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filt);
+    setsockopt(sc->sockfd, IPPROTO_ICMPV6, ICMP6_FILTER,
+               &filt, sizeof(filt));
 
-    if (connect(sc->sockfd, res->ai_addr, res->ai_addrlen) < 0) {
-        perror("connect (switch agent)");
-        close(sc->sockfd);
-        sc->sockfd = -1;
-        freeaddrinfo(res);
-        return -1;
-    }
+    /* Receive timeout for reliability. */
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(sc->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    freeaddrinfo(res);
-    printf("Connected to switch agent at %s:%s\n", sc->host, sc->port);
+    printf("ICMPv6 switch agent: %s\n", addr);
     return 0;
 }
 
 /*
- * Send a command, read the one-line response.
- * Returns the response latency in microseconds, or -1 on error.
+ * Send a command via ICMPv6 echo request and wait for the agent's
+ * echo reply.  The kernel on the switch will also auto-reply with
+ * the original payload echoed back — we skip those and look for a
+ * reply whose payload starts with "OK", "ERR", or "PONG".
+ *
+ * Returns the round-trip time in microseconds, or -1 on error.
  */
-static long switch_conn_send(switch_conn *sc, const char *cmd)
+static long switch_conn_send(switch_conn *sc, const char *cmd,
+                             char *resp_out, size_t resp_sz)
 {
     if (sc->sockfd < 0) return 0;
+
+    uint16_t seq = sc->seq++;
+    size_t cmd_len = strlen(cmd);
+
+    /* Build echo request: 8-byte header + payload. */
+    size_t pkt_len = 8 + cmd_len;
+    uint8_t pkt[8 + 256];
+    if (pkt_len > sizeof(pkt)) pkt_len = sizeof(pkt);
+
+    memset(pkt, 0, 8);
+    pkt[0] = ICMP6_ECHO_REQUEST;           /* type   */
+    pkt[1] = 0;                             /* code   */
+    /* [2-3] checksum: kernel fills        */
+    pkt[4] = (DIDAQT_ICMP_ID >> 8) & 0xFF; /* id hi  */
+    pkt[5] = DIDAQT_ICMP_ID & 0xFF;        /* id lo  */
+    pkt[6] = (seq >> 8) & 0xFF;             /* seq hi */
+    pkt[7] = seq & 0xFF;                    /* seq lo */
+    memcpy(pkt + 8, cmd, cmd_len);
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    size_t len = strlen(cmd);
-    if (send(sc->sockfd, cmd, len, 0) != (ssize_t)len)
+    if (sendto(sc->sockfd, pkt, pkt_len, 0,
+               (struct sockaddr *)&sc->dest, sizeof(sc->dest)) < 0) {
+        perror("sendto ICMPv6");
         return -1;
-
-    /* Read response line. */
-    char resp[256];
-    int pos = 0;
-    while (pos < (int)sizeof(resp) - 1) {
-        ssize_t n = recv(sc->sockfd, resp + pos, 1, 0);
-        if (n <= 0) return -1;
-        if (resp[pos] == '\n') break;
-        pos++;
     }
-    resp[pos] = '\0';
 
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    long us = (t1.tv_sec - t0.tv_sec) * 1000000L
-            + (t1.tv_nsec - t0.tv_nsec) / 1000;
+    /* Wait for agent reply (skip kernel auto-echoes). */
+    uint8_t buf[8 + 256];
+    for (int tries = 0; tries < 10; tries++) {
+        struct sockaddr_in6 src;
+        socklen_t slen = sizeof(src);
+        ssize_t n = recvfrom(sc->sockfd, buf, sizeof(buf), 0,
+                             (struct sockaddr *)&src, &slen);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return -1;   /* timeout */
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n < 8) continue;
 
-    return us;
+        /* Check type=echo_reply, id, seq. */
+        if (buf[0] != ICMP6_ECHO_REPLY) continue;
+        uint16_t rid = ((uint16_t)buf[4] << 8) | buf[5];
+        uint16_t rseq = ((uint16_t)buf[6] << 8) | buf[7];
+        if (rid != DIDAQT_ICMP_ID || rseq != seq) continue;
+
+        /* Skip kernel auto-echo (payload == sent command).
+         * Accept agent reply (starts with OK/ERR/PONG). */
+        int payload_len = (int)n - 8;
+        if (payload_len <= 0) continue;
+        char *payload = (char *)(buf + 8);
+
+        if (strncmp(payload, "OK", 2) == 0 ||
+            strncmp(payload, "ERR", 3) == 0 ||
+            strncmp(payload, "PONG", 4) == 0) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long us = (t1.tv_sec - t0.tv_sec) * 1000000L
+                    + (t1.tv_nsec - t0.tv_nsec) / 1000;
+
+            if (resp_out && resp_sz > 0) {
+                size_t cpy = (size_t)payload_len < resp_sz - 1
+                           ? (size_t)payload_len : resp_sz - 1;
+                memcpy(resp_out, payload, cpy);
+                resp_out[cpy] = '\0';
+            }
+            return us;
+        }
+        /* Kernel auto-echo — skip and keep waiting. */
+    }
+
+    return -1;
 }
 
 static void switch_conn_close(switch_conn *sc)
@@ -161,7 +205,6 @@ static int switch_handler(uint64_t sender_id,
     switch_conn *sc = (switch_conn *)user_data;
 
     if (sc->sockfd < 0) {
-        /* Log-only mode. */
         printf("  SWITCH UPDATE (log): sender_id=%lu  "
                "(%d,%d) -> (%d,%d)\n",
                (unsigned long)sender_id,
@@ -169,22 +212,22 @@ static int switch_handler(uint64_t sender_id,
         return 0;
     }
 
-    /* Send real command to the switch agent. */
     char cmd[128];
-    snprintf(cmd, sizeof(cmd), "UPDATE %lu %d %d %d %d\n",
+    snprintf(cmd, sizeof(cmd), "UPDATE %lu %d %d %d %d",
              (unsigned long)sender_id,
              cur_in, cur_out, new_in, new_out);
 
-    long us = switch_conn_send(sc, cmd);
+    char resp[128] = {0};
+    long us = switch_conn_send(sc, cmd, resp, sizeof(resp));
     if (us < 0) {
-        fprintf(stderr, "  SWITCH UPDATE FAILED: send error\n");
+        fprintf(stderr, "  SWITCH UPDATE FAILED: no response\n");
         return -1;
     }
 
     printf("  SWITCH UPDATE: sender_id=%lu  (%d,%d) -> (%d,%d)  "
-           "rtt=%ld us\n",
+           "rtt=%ld us  resp=%s\n",
            (unsigned long)sender_id,
-           cur_in, cur_out, new_in, new_out, us);
+           cur_in, cur_out, new_in, new_out, us, resp);
     return 0;
 }
 
@@ -197,7 +240,7 @@ int main(int argc, char **argv)
     if (argc < 3 || argc > 4) {
         fprintf(stderr,
                 "Usage: %s <topology.yaml> <heartbeat_port> "
-                "[switch_agent_host:port]\n", argv[0]);
+                "[switch_ipv6]\n", argv[0]);
         return 1;
     }
 
@@ -208,22 +251,22 @@ int main(int argc, char **argv)
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
-    /* ---- Connect to switch agent (if specified) ---- */
+    /* ---- Open ICMPv6 channel to switch agent ---- */
     switch_conn sc;
     if (switch_conn_open(&sc, agent_addr) < 0) {
-        fprintf(stderr, "Could not connect to switch agent\n");
+        fprintf(stderr, "Could not open ICMPv6 channel\n");
         return 1;
     }
 
     if (sc.sockfd >= 0) {
-        /* Verify with PING. */
-        long us = switch_conn_send(&sc, "PING\n");
+        char resp[64];
+        long us = switch_conn_send(&sc, "PING", resp, sizeof(resp));
         if (us < 0) {
-            fprintf(stderr, "Switch agent PING failed\n");
+            fprintf(stderr, "Switch agent PING failed (no reply)\n");
             switch_conn_close(&sc);
             return 1;
         }
-        printf("Switch agent PING OK (rtt=%ld us)\n", us);
+        printf("Switch agent PING OK: %s (rtt=%ld us)\n", resp, us);
     } else {
         printf("Running in log-only mode (no switch agent)\n");
     }
@@ -236,7 +279,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* ---- Process topology ---- */
     printf("Loading topology: %s\n", topo_path);
     if (didaqt_ctrl_process_topology(topo_path, ctx) != DIDAQT_OK) {
         fprintf(stderr, "didaqt_ctrl_process_topology failed\n");
