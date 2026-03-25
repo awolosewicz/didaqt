@@ -103,8 +103,8 @@ static void draw_display(uint16_t hb_port)
             }
         }
         if (!found && num_receivers < 64)
-            strncpy(receivers[num_receivers++],
-                    paths[i].receiver_name, DIDAQT_MAX_NAME - 1);
+            snprintf(receivers[num_receivers++], DIDAQT_MAX_NAME,
+                     "%s", paths[i].receiver_name);
     }
 
     /* For each receiver, show which senders are routed to it. */
