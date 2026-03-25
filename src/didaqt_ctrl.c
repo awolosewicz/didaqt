@@ -147,7 +147,8 @@ static uint64_t parse_bandwidth(const char *s)
 /*  YAML helpers (document API)                                        */
 /* ------------------------------------------------------------------ */
 
-static const char *scalar_val(yaml_document_t *doc, yaml_node_t *n)
+static const char *scalar_val(__attribute__((unused)) yaml_document_t *doc,
+                              yaml_node_t *n)
 {
     if (!n || n->type != YAML_SCALAR_NODE) return NULL;
     return (const char *)n->data.scalar.value;
