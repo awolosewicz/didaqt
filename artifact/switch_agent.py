@@ -41,7 +41,16 @@ if os.path.exists(STOP_FILE):
     os.unlink(STOP_FILE)
 
 # ---- Discover port mapping (logical name -> dev_port) ----
-port_dump = bfrt.port.port.dump(return_ents=True)
+# Suppress the spurious "entry_scope_attributes_allocate failed" warning
+# that port.port.dump() prints to stdout on some SDE versions.
+import io, sys
+_old_stdout = sys.stdout
+sys.stdout = io.StringIO()
+try:
+    port_dump = bfrt.port.port.dump(return_ents=True)
+finally:
+    sys.stdout = _old_stdout
+
 port_map = {}
 if port_dump:
     for ent in port_dump:
@@ -61,6 +70,30 @@ def resolve_port(logical):
     """Map a logical port number to a Tofino dev_port."""
     return port_map.get(str(logical))
 
+# Build a lookup from dev_port -> (dst_addr, vlan_id) from the initial
+# table state.  This avoids relying on dump(return_ents=True) at runtime,
+# which can fail silently on some SDE versions.
+fwd_table = {}   # dev_port -> (dst_addr_int, vlan_id)
+
+def snapshot_fwd_table():
+    """Capture current forwarding table entries into fwd_table."""
+    global fwd_table
+    fwd_table.clear()
+    try:
+        entries = l2_fwd.dump(return_ents=True)
+        if entries:
+            for ent in entries:
+                dp = ent.data.get('port') or ent.data.get(b'port')
+                dst = ent.key.get('dst_addr') or ent.key.get(b'dst_addr')
+                vid = ent.data.get('vlan_id', ent.data.get(b'vlan_id', 0))
+                if dp is not None and dst is not None:
+                    fwd_table[dp] = (dst, vid)
+        print(f"  fwd_table snapshot: {fwd_table}")
+    except Exception as e:
+        print(f"  fwd_table snapshot failed: {e}")
+
+snapshot_fwd_table()
+
 def handle_update(sender_id, cur_in, cur_out, new_in, new_out):
     """Apply a forwarding table change for a failover."""
     t0 = time.monotonic()
@@ -72,30 +105,29 @@ def handle_update(sender_id, cur_in, cur_out, new_in, new_out):
         return False, "unknown new egress port"
 
     try:
-        entries = l2_fwd.dump(return_ents=True, from_hw=True)
-        modified = False
-        if entries and dev_cur_out is not None:
-            for ent in entries:
-                port_val = ent.data.get('port') or ent.data.get(b'port')
-                if port_val == dev_cur_out:
-                    dst = ent.key.get('dst_addr') or ent.key.get(b'dst_addr')
-                    vlan = ent.data.get('vlan_id', ent.data.get(b'vlan_id', 0))
-                    # bfrt_python has no .mod(); delete + re-add.
-                    l2_fwd.delete(dst_addr=dst)
-                    l2_fwd.add_with_forward(
-                        dst_addr=dst,
-                        port=dev_new_out,
-                        vlan_id=vlan
-                    )
-                    modified = True
-                    break
+        # Look up the entry from our cached table.
+        if dev_cur_out is None or dev_cur_out not in fwd_table:
+            return False, f"no entry for dev_port {dev_cur_out}"
 
+        dst, vlan = fwd_table[dev_cur_out]
+
+        # Delete old entry and add with new egress port.
+        l2_fwd.delete(dst_addr=dst)
+        l2_fwd.add_with_forward(
+            dst_addr=dst,
+            port=dev_new_out,
+            vlan_id=vlan
+        )
         bfrt.complete_operations()
-        elapsed_us = int((time.monotonic() - t0) * 1e6)
 
-        action = "modified" if modified else "no matching entry"
-        print(f"  UPDATE sender={sender_id} egress {cur_out}->{new_out} "
-              f"(dev {dev_cur_out}->{dev_new_out}) [{action}] {elapsed_us}us")
+        # Update our cache to reflect the change.
+        del fwd_table[dev_cur_out]
+        fwd_table[dev_new_out] = (dst, vlan)
+
+        elapsed_us = int((time.monotonic() - t0) * 1e6)
+        print(f"  UPDATE sender={sender_id} dst=0x{dst:x} "
+              f"egress {cur_out}->{new_out} "
+              f"(dev {dev_cur_out}->{dev_new_out}) {elapsed_us}us")
         return True, str(elapsed_us)
 
     except Exception as e:
