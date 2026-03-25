@@ -262,8 +262,6 @@ int main(int argc, char **argv)
 
     /* --- Transmit loop --- */
     uint64_t tx_count = 0;
-    struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
 
     while (running) {
         uint8_t *frame = (faulty && (tx_count & 1))
@@ -275,18 +273,6 @@ int main(int argc, char **argv)
             break;
         }
         tx_count++;
-
-        /* Print rate every ~1 million frames. */
-        if ((tx_count & 0xFFFFF) == 0) {
-            struct timespec t1;
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            double elapsed = (t1.tv_sec  - t0.tv_sec)
-                           + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
-            double gbps = (double)tx_count * FRAME_LEN * 8.0
-                        / elapsed / 1e9;
-            printf("sender %u: %lu frames, %.2f Gbps\n",
-                   sender_id, tx_count, gbps);
-        }
     }
 
     close(sockfd);

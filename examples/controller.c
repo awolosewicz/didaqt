@@ -5,21 +5,11 @@
  * reachability analysis, then listens for heartbeat packets and
  * runs the failover state machine.
  *
- * When a switch agent address is provided, failover actions are
- * sent as ICMPv6 echo request/reply messages to the agent running
- * on the Tofino, and the round-trip time is measured.  ICMPv6 is
- * used because FABRIC's management plane allows ICMP but blocks
- * arbitrary TCP/UDP between nodes.
+ * Displays a live terminal UI showing sender routing and a
+ * scrolling log of failover events.
  *
  * Usage:
  *   ./controller <topology.yaml> <heartbeat_port> [switch_ipv6]
- *
- * Examples:
- *   ./controller topology.yaml 9000                         # log-only
- *   ./controller topology.yaml 9000 2001:db8::1             # live updates
- *
- * Build:
- *   make build/controller
  *
  * Requires: CAP_NET_RAW (run with sudo).
  */
@@ -28,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
@@ -51,13 +42,116 @@ static void handle_signal(int sig)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Event log ring buffer                                              */
+/* ------------------------------------------------------------------ */
+
+#define LOG_LINES    16
+#define LOG_LINE_LEN 120
+
+static char   event_log[LOG_LINES][LOG_LINE_LEN];
+static int    log_next = 0;     /* next write slot */
+static int    log_count = 0;    /* total entries written */
+
+static void log_event(const char *fmt, ...)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm *tm = localtime(&ts.tv_sec);
+
+    char *line = event_log[log_next % LOG_LINES];
+    int pos = snprintf(line, LOG_LINE_LEN, "[%02d:%02d:%02d] ",
+                       tm->tm_hour, tm->tm_min, tm->tm_sec);
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line + pos, LOG_LINE_LEN - pos, fmt, ap);
+    va_end(ap);
+
+    log_next = (log_next + 1) % LOG_LINES;
+    if (log_count < LOG_LINES) log_count++;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Terminal display                                                   */
+/* ------------------------------------------------------------------ */
+
+static didaqt_ctrl_ctx *g_ctx = NULL;   /* for display access */
+
+static void draw_display(uint16_t hb_port)
+{
+    if (!g_ctx) return;
+
+    didaqt_path_info *paths = NULL;
+    int path_count = 0;
+    didaqt_ctrl_get_path_statuses(g_ctx, &paths, &path_count);
+
+    printf("\033[H");   /* cursor home */
+
+    printf("\033[1m  DiDAQt Controller\033[0m — UDP port %u\033[K\n",
+           hb_port);
+    printf("  ══════════════════════════════════════════════════\033[K\n");
+
+    /* Collect unique receiver names from Used paths. */
+    char receivers[64][DIDAQT_MAX_NAME];
+    int num_receivers = 0;
+    for (int i = 0; i < path_count; i++) {
+        int found = 0;
+        for (int r = 0; r < num_receivers; r++) {
+            if (strcmp(receivers[r], paths[i].receiver_name) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found && num_receivers < 64)
+            strncpy(receivers[num_receivers++],
+                    paths[i].receiver_name, DIDAQT_MAX_NAME - 1);
+    }
+
+    /* For each receiver, show which senders are routed to it. */
+    for (int r = 0; r < num_receivers; r++) {
+        printf("  \033[1m%-10s\033[0m:", receivers[r]);
+        int col = 0;
+        for (int i = 0; i < path_count; i++) {
+            if (paths[i].status != DIDAQT_PATH_USED) continue;
+            if (strcmp(paths[i].receiver_name, receivers[r]) != 0) continue;
+            if (col > 0 && col % 12 == 0)
+                printf("\n            ");
+            printf(" %s", paths[i].sender_name);
+            col++;
+        }
+        if (col == 0)
+            printf(" \033[2m(none)\033[0m");
+        printf("\033[K\n");
+    }
+
+    printf("  ══════════════════════════════════════════════════\033[K\n");
+    printf("  \033[1mEvent Log:\033[0m\033[K\n");
+
+    /* Print log entries oldest-first. */
+    int start = (log_count < LOG_LINES) ? 0 : log_next;
+    int count = (log_count < LOG_LINES) ? log_count : LOG_LINES;
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % LOG_LINES;
+        printf("  %s\033[K\n", event_log[idx]);
+    }
+    /* Pad remaining log lines to keep display stable. */
+    for (int i = count; i < LOG_LINES; i++)
+        printf("  \033[K\n");
+
+    printf("\033[J");   /* clear below */
+    fflush(stdout);
+
+    free(paths);
+}
+
+/* ------------------------------------------------------------------ */
 /*  ICMPv6 switch agent connection                                     */
 /* ------------------------------------------------------------------ */
 
 #define DIDAQT_ICMP_ID  0xDDAA
 
 typedef struct {
-    int                sockfd;    /* -1 = log-only mode */
+    int                sockfd;
     struct sockaddr_in6 dest;
     uint16_t           seq;
 } switch_conn;
@@ -66,45 +160,32 @@ static int switch_conn_open(switch_conn *sc, const char *addr)
 {
     memset(sc, 0, sizeof(*sc));
     sc->sockfd = -1;
-    if (!addr) return 0;   /* log-only mode */
+    if (!addr) return 0;
 
-    /* Resolve IPv6 address. */
     if (inet_pton(AF_INET6, addr, &sc->dest.sin6_addr) != 1) {
         fprintf(stderr, "bad IPv6 address: %s\n", addr);
         return -1;
     }
     sc->dest.sin6_family = AF_INET6;
 
-    /* Open raw ICMPv6 socket. */
     sc->sockfd = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
     if (sc->sockfd < 0) {
         perror("socket (ICMPv6 raw)");
         return -1;
     }
 
-    /* Filter: only receive echo replies. */
     struct icmp6_filter filt;
     ICMP6_FILTER_SETBLOCKALL(&filt);
     ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filt);
     setsockopt(sc->sockfd, IPPROTO_ICMPV6, ICMP6_FILTER,
                &filt, sizeof(filt));
 
-    /* Receive timeout for reliability. */
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(sc->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    printf("ICMPv6 switch agent: %s\n", addr);
     return 0;
 }
 
-/*
- * Send a command via ICMPv6 echo request and wait for the agent's
- * echo reply.  The kernel on the switch will also auto-reply with
- * the original payload echoed back — we skip those and look for a
- * reply whose payload starts with "OK", "ERR", or "PONG".
- *
- * Returns the round-trip time in microseconds, or -1 on error.
- */
 static long switch_conn_send(switch_conn *sc, const char *cmd,
                              char *resp_out, size_t resp_sz)
 {
@@ -113,31 +194,25 @@ static long switch_conn_send(switch_conn *sc, const char *cmd,
     uint16_t seq = sc->seq++;
     size_t cmd_len = strlen(cmd);
 
-    /* Build echo request: 8-byte header + payload. */
     size_t pkt_len = 8 + cmd_len;
     uint8_t pkt[8 + 256];
     if (pkt_len > sizeof(pkt)) pkt_len = sizeof(pkt);
 
     memset(pkt, 0, 8);
-    pkt[0] = ICMP6_ECHO_REQUEST;           /* type   */
-    pkt[1] = 0;                             /* code   */
-    /* [2-3] checksum: kernel fills        */
-    pkt[4] = (DIDAQT_ICMP_ID >> 8) & 0xFF; /* id hi  */
-    pkt[5] = DIDAQT_ICMP_ID & 0xFF;        /* id lo  */
-    pkt[6] = (seq >> 8) & 0xFF;             /* seq hi */
-    pkt[7] = seq & 0xFF;                    /* seq lo */
+    pkt[0] = ICMP6_ECHO_REQUEST;
+    pkt[4] = (DIDAQT_ICMP_ID >> 8) & 0xFF;
+    pkt[5] = DIDAQT_ICMP_ID & 0xFF;
+    pkt[6] = (seq >> 8) & 0xFF;
+    pkt[7] = seq & 0xFF;
     memcpy(pkt + 8, cmd, cmd_len);
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     if (sendto(sc->sockfd, pkt, pkt_len, 0,
-               (struct sockaddr *)&sc->dest, sizeof(sc->dest)) < 0) {
-        perror("sendto ICMPv6");
+               (struct sockaddr *)&sc->dest, sizeof(sc->dest)) < 0)
         return -1;
-    }
 
-    /* Wait for agent reply (skip kernel auto-echoes). */
     uint8_t buf[8 + 256];
     for (int tries = 0; tries < 10; tries++) {
         struct sockaddr_in6 src;
@@ -145,21 +220,16 @@ static long switch_conn_send(switch_conn *sc, const char *cmd,
         ssize_t n = recvfrom(sc->sockfd, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src, &slen);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return -1;   /* timeout */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
             if (errno == EINTR) continue;
             return -1;
         }
         if (n < 8) continue;
-
-        /* Check type=echo_reply, id, seq. */
         if (buf[0] != ICMP6_ECHO_REPLY) continue;
         uint16_t rid = ((uint16_t)buf[4] << 8) | buf[5];
         uint16_t rseq = ((uint16_t)buf[6] << 8) | buf[7];
         if (rid != DIDAQT_ICMP_ID || rseq != seq) continue;
 
-        /* Skip kernel auto-echo (payload == sent command).
-         * Accept agent reply (starts with OK/ERR/PONG). */
         int payload_len = (int)n - 8;
         if (payload_len <= 0) continue;
         char *payload = (char *)(buf + 8);
@@ -170,7 +240,6 @@ static long switch_conn_send(switch_conn *sc, const char *cmd,
             clock_gettime(CLOCK_MONOTONIC, &t1);
             long us = (t1.tv_sec - t0.tv_sec) * 1000000L
                     + (t1.tv_nsec - t0.tv_nsec) / 1000;
-
             if (resp_out && resp_sz > 0) {
                 size_t cpy = (size_t)payload_len < resp_sz - 1
                            ? (size_t)payload_len : resp_sz - 1;
@@ -179,9 +248,7 @@ static long switch_conn_send(switch_conn *sc, const char *cmd,
             }
             return us;
         }
-        /* Kernel auto-echo — skip and keep waiting. */
     }
-
     return -1;
 }
 
@@ -205,10 +272,9 @@ static int switch_handler(uint64_t sender_id,
     switch_conn *sc = (switch_conn *)user_data;
 
     if (sc->sockfd < 0) {
-        printf("  SWITCH UPDATE (log): sender_id=%lu  "
-               "(%d,%d) -> (%d,%d)\n",
-               (unsigned long)sender_id,
-               cur_in, cur_out, new_in, new_out);
+        log_event("FAILOVER sender=%lu (%d,%d)->(%d,%d) [log-only]",
+                  (unsigned long)sender_id,
+                  cur_in, cur_out, new_in, new_out);
         return 0;
     }
 
@@ -220,14 +286,15 @@ static int switch_handler(uint64_t sender_id,
     char resp[128] = {0};
     long us = switch_conn_send(sc, cmd, resp, sizeof(resp));
     if (us < 0) {
-        fprintf(stderr, "  SWITCH UPDATE FAILED: no response\n");
+        log_event("FAILOVER sender=%lu (%d,%d)->(%d,%d) FAILED",
+                  (unsigned long)sender_id,
+                  cur_in, cur_out, new_in, new_out);
         return -1;
     }
 
-    printf("  SWITCH UPDATE: sender_id=%lu  (%d,%d) -> (%d,%d)  "
-           "rtt=%ld us  resp=%s\n",
-           (unsigned long)sender_id,
-           cur_in, cur_out, new_in, new_out, us, resp);
+    log_event("FAILOVER sender=%lu (%d,%d)->(%d,%d) rtt=%ldus %s",
+              (unsigned long)sender_id,
+              cur_in, cur_out, new_in, new_out, us, resp);
     return 0;
 }
 
@@ -266,9 +333,9 @@ int main(int argc, char **argv)
             switch_conn_close(&sc);
             return 1;
         }
-        printf("Switch agent PING OK: %s (rtt=%ld us)\n", resp, us);
+        fprintf(stderr, "Switch agent PING OK: %s (rtt=%ld us)\n", resp, us);
     } else {
-        printf("Running in log-only mode (no switch agent)\n");
+        fprintf(stderr, "Running in log-only mode (no switch agent)\n");
     }
 
     /* ---- Initialise controller context ---- */
@@ -279,7 +346,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("Loading topology: %s\n", topo_path);
+    fprintf(stderr, "Loading topology: %s\n", topo_path);
     if (didaqt_ctrl_process_topology(topo_path, ctx) != DIDAQT_OK) {
         fprintf(stderr, "didaqt_ctrl_process_topology failed\n");
         didaqt_ctrl_destroy(ctx);
@@ -287,29 +354,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Print initial path state. */
-    didaqt_path_info *paths = NULL;
-    int path_count = 0;
-    didaqt_ctrl_get_path_statuses(ctx, &paths, &path_count);
-    printf("\nInitial paths (%d total):\n", path_count);
-    for (int i = 0; i < path_count; i++) {
-        const char *st;
-        switch (paths[i].status) {
-        case DIDAQT_PATH_USED:        st = "USED";        break;
-        case DIDAQT_PATH_AVAILABLE:   st = "AVAILABLE";   break;
-        case DIDAQT_PATH_TEMP_FAILED: st = "TEMP_FAILED"; break;
-        case DIDAQT_PATH_FAILED:      st = "FAILED";      break;
-        default:                      st = "?";            break;
-        }
-        printf("  [%d] sender=%s -> receiver=%s  %s\n",
-               paths[i].path_id, paths[i].sender_name,
-               paths[i].receiver_name, st);
-    }
-    free(paths);
+    g_ctx = ctx;
 
     /* ---- Register switch handler ---- */
     didaqt_ctrl_register_handler(ctx, "tofino2", switch_handler, &sc);
-    printf("\nSwitch handler registered for type 'tofino2'\n");
 
     /* ---- Open heartbeat listener (IPv6 dual-stack) ---- */
     int sockfd = socket(AF_INET6, SOCK_DGRAM, 0);
@@ -339,12 +387,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("Controller listening for heartbeats on UDP port %u\n\n",
-           hb_port);
+    fprintf(stderr, "Listening on UDP port %u — starting display.\n\n",
+            hb_port);
+
+    /* Clear screen and draw initial display. */
+    printf("\033[2J");
+    draw_display(hb_port);
 
     /* ---- Main loop ---- */
     uint8_t buf[6 + DIDAQT_MAX_SENDERS * 4];
-    uint64_t hb_count = 0;
 
     while (running) {
         struct sockaddr_storage src;
@@ -359,34 +410,16 @@ int main(int argc, char **argv)
         }
         if (n < 6) continue;
 
-        hb_count++;
+        didaqt_ctrl_process_heartbeat(buf, (size_t)n, ctx);
 
-        uint32_t rid;
-        uint16_t scnt;
-        memcpy(&rid,  buf,     4); rid  = ntohl(rid);
-        memcpy(&scnt, buf + 4, 2); scnt = ntohs(scnt);
-
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-
-        int rc = didaqt_ctrl_process_heartbeat(buf, (size_t)n, ctx);
-
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        long proc_us = (t1.tv_sec - t0.tv_sec) * 1000000L
-                     + (t1.tv_nsec - t0.tv_nsec) / 1000;
-
-        printf("[HB #%lu] receiver_id=%u senders=%u  proc=%ld us\n",
-               (unsigned long)hb_count, rid, scnt, proc_us);
-
-        if (rc != DIDAQT_OK) {
-            printf("  (heartbeat processing error: rc=%d)\n", rc);
-        }
+        /* Redraw after each heartbeat. */
+        draw_display(hb_port);
     }
 
     close(sockfd);
     switch_conn_close(&sc);
     didaqt_ctrl_destroy(ctx);
-    printf("\nController stopped after %lu heartbeats\n",
-           (unsigned long)hb_count);
+    printf("\033[2J\033[H");
+    printf("Controller stopped.\n");
     return 0;
 }
