@@ -1017,6 +1017,11 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
     int recv_idx = find_receiver_by_id(ctx, rid);
     if (recv_idx < 0) return DIDAQT_ERR;
 
+    /* Track which groups have already been failed over in this
+     * heartbeat to avoid processing the same group multiple times. */
+    uint32_t handled_groups[MAX_NODES];
+    int num_handled_groups = 0;
+
     /* For each sender with a Used path to this receiver: */
     for (int i = 0; i < ctx->num_paths; i++) {
         ctrl_path *p = &ctx->paths[i];
@@ -1028,20 +1033,25 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
         uint64_t sid = ctx->nodes[s].sender_id;
 
         if (sender_in_list(sid, sids, scnt)) {
-            /* Sender is healthy — mark as seen and confirm any
-             * TempFailed paths as truly Failed. */
             ctx->sender_seen[s] = 1;
             confirm_failed(ctx, s);
         } else if (ctx->sender_seen[s] && !in_grace_period(ctx, s)) {
-            /* Sender was previously seen, is now missing, and the
-             * grace period has expired — initiate failover. */
             uint32_t gid = ctx->nodes[s].group_id;
-            if (gid != 0)
-                failover_group(ctx, gid);
-            else
+            if (gid != 0) {
+                /* Skip if this group was already handled. */
+                int already = 0;
+                for (int g = 0; g < num_handled_groups; g++) {
+                    if (handled_groups[g] == gid) { already = 1; break; }
+                }
+                if (!already) {
+                    failover_group(ctx, gid);
+                    if (num_handled_groups < MAX_NODES)
+                        handled_groups[num_handled_groups++] = gid;
+                }
+            } else {
                 failover_sender(ctx, s, i);
+            }
         }
-        /* else: sender never seen or within grace period — ignore. */
     }
 
     return DIDAQT_OK;

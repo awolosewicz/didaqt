@@ -17,15 +17,15 @@
  * Flags:
  *   -f    Faulty mode: alternate between valid and invalid magic
  *         values every packet, simulating intermittent data corruption.
- *   -1    Send a single faulty packet then resume normal operation.
+ *   -o    Send one faulty packet then resume normal operation.
  *
  * Usage:
- *   ./sender [-f|-1] <interface> <dst_mac> <sender_id> [vlan_id]
+ *   ./sender [-f|-o] <interface> <dst_mac> <sender_id> [vlan_id]
  *
  * Example:
  *   ./sender eth0 00:11:22:33:44:55 1 100
  *   ./sender -f eth0 00:11:22:33:44:55 1 100
- *   ./sender -1 eth0 00:11:22:33:44:55 1 100
+ *   ./sender -o eth0 00:11:22:33:44:55 1 100
  *
  * Build (on a Linux host):
  *   gcc -O2 -Wall -o sender sender.c
@@ -176,12 +176,12 @@ int main(int argc, char **argv)
 {
     /* Parse optional flags. */
     int faulty = 0;       /* -f: alternate every packet */
-    int single_fault = 0; /* -1: one bad packet then normal */
+    int single_fault = 0; /* -o: one bad packet then normal */
     if (argc > 1 && strcmp(argv[1], "-f") == 0) {
         faulty = 1;
         argv++;
         argc--;
-    } else if (argc > 1 && strcmp(argv[1], "-1") == 0) {
+    } else if (argc > 1 && strcmp(argv[1], "-o") == 0) {
         single_fault = 1;
         argv++;
         argc--;
@@ -189,7 +189,7 @@ int main(int argc, char **argv)
 
     if (argc < 4 || argc > 5) {
         fprintf(stderr,
-                "Usage: %s [-f|-1] <interface> <dst_mac> <sender_id> [vlan_id]\n",
+                "Usage: %s [-f|-o] <interface> <dst_mac> <sender_id> [vlan_id]\n",
                 argv[0]);
         return 1;
     }
@@ -263,7 +263,7 @@ int main(int argc, char **argv)
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
-    const char *mode = faulty ? " [FAULTY]" : single_fault ? " [SINGLE-FAULT]" : "";
+    const char *mode = faulty ? " [FAULTY]" : single_fault ? " [ONE-FAULT]" : "";
     printf("sender %u: sending %d-byte frames on %s -> %s (vlan %u)%s\n",
            sender_id, FRAME_LEN, ifname, dst_mac_s, vlan_id, mode);
 
