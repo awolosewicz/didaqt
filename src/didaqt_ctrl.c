@@ -3,9 +3,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <yaml.h>
+
+#define FAILOVER_GRACE_NS 1000000000L  /* 1 second grace period */
 
 /* ------------------------------------------------------------------ */
 /*  Internal limits                                                    */
@@ -97,6 +100,11 @@ struct didaqt_ctrl_ctx {
     /* Per-sender dead flag: indexed by node index.
      * Set when all paths are exhausted; cleared by revive. */
     int          sender_dead[MAX_NODES];
+
+    /* Per-sender last-failover timestamp.  Missing-sender events are
+     * ignored for FAILOVER_GRACE_NS after a failover to allow traffic
+     * to reach the new receiver. */
+    struct timespec last_failover[MAX_NODES];
 
     ctrl_handler handlers[MAX_HANDLERS];
     int          num_handlers;
@@ -686,7 +694,23 @@ static void confirm_failed(didaqt_ctrl_ctx *ctx, int sender_idx)
             ctx->paths[i].status = DIDAQT_PATH_FAILED;
 }
 
-/* Perform failover for a single sender. */
+/* Record a failover timestamp for a sender (starts the grace period). */
+static void mark_failover_time(didaqt_ctrl_ctx *ctx, int sender_idx)
+{
+    clock_gettime(CLOCK_MONOTONIC, &ctx->last_failover[sender_idx]);
+}
+
+/* Check if a sender is within the post-failover grace period. */
+static int in_grace_period(const didaqt_ctrl_ctx *ctx, int sender_idx)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ns = (now.tv_sec  - ctx->last_failover[sender_idx].tv_sec) * 1000000000L
+                    + (now.tv_nsec - ctx->last_failover[sender_idx].tv_nsec);
+    return elapsed_ns < FAILOVER_GRACE_NS;
+}
+
+/* Perform failover for a single (ungrouped) sender. */
 static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
                             int old_path_idx)
 {
@@ -699,10 +723,8 @@ static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
     if (new_idx >= 0) {
         ctx->paths[new_idx].status = DIDAQT_PATH_USED;
         execute_failover(ctx, sid, old, &ctx->paths[new_idx]);
+        mark_failover_time(ctx, sender_idx);
     } else {
-        /* All paths exhausted for this sender.  Mark the sender dead
-         * and return its TEMP_FAILED paths to AVAILABLE so that other
-         * senders sharing those paths can still use them. */
         ctx->sender_dead[sender_idx] = 1;
         for (int i = 0; i < ctx->num_paths; i++) {
             if (ctx->paths[i].sender_idx == sender_idx &&
@@ -715,22 +737,82 @@ static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
     }
 }
 
-/* Failover all senders in the same group together. */
+/*
+ * Failover all senders in the same group together.
+ *
+ * All senders in a group share the same receiver, so this:
+ *   1. Picks a representative sender to determine old/new paths
+ *   2. Moves ALL group members' path state atomically
+ *   3. Executes ONE switch update (they share the forwarding entry)
+ */
 static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id)
 {
-    for (int s = 0; s < ctx->num_nodes; s++) {
+    /* Find a representative sender and its current Used path. */
+    int rep = -1, rep_old = -1;
+    for (int s = 0; s < ctx->num_nodes && rep < 0; s++) {
         if (!node_is_sender(&ctx->nodes[s])) continue;
         if (ctx->nodes[s].group_id != group_id) continue;
-
-        /* Find the sender's currently Used path. */
         for (int i = 0; i < ctx->num_paths; i++) {
             if (ctx->paths[i].sender_idx == s &&
                 ctx->paths[i].status == DIDAQT_PATH_USED) {
-                failover_sender(ctx, s, i);
+                rep = s;
+                rep_old = i;
                 break;
             }
         }
     }
+    if (rep < 0) return;
+
+    /* Find the new receiver via the representative's Available paths. */
+    int rep_new = first_available(ctx, rep);
+    if (rep_new < 0) {
+        /* All paths exhausted — mark entire group dead. */
+        for (int s = 0; s < ctx->num_nodes; s++) {
+            if (!node_is_sender(&ctx->nodes[s])) continue;
+            if (ctx->nodes[s].group_id != group_id) continue;
+            ctx->sender_dead[s] = 1;
+            for (int i = 0; i < ctx->num_paths; i++) {
+                if (ctx->paths[i].sender_idx == s &&
+                    ctx->paths[i].status == DIDAQT_PATH_TEMP_FAILED)
+                    ctx->paths[i].status = DIDAQT_PATH_AVAILABLE;
+            }
+        }
+        fprintf(stderr, "group %u: all paths exhausted\n", group_id);
+        return;
+    }
+
+    int new_receiver = ctx->paths[rep_new].receiver_idx;
+
+    /* Move ALL senders in the group: Used→TempFailed, Available(new)→Used. */
+    for (int s = 0; s < ctx->num_nodes; s++) {
+        if (!node_is_sender(&ctx->nodes[s])) continue;
+        if (ctx->nodes[s].group_id != group_id) continue;
+
+        /* TempFail the current Used path. */
+        for (int i = 0; i < ctx->num_paths; i++) {
+            if (ctx->paths[i].sender_idx == s &&
+                ctx->paths[i].status == DIDAQT_PATH_USED) {
+                ctx->paths[i].status = DIDAQT_PATH_TEMP_FAILED;
+                break;
+            }
+        }
+
+        /* Activate the path to the new receiver. */
+        for (int i = 0; i < ctx->num_paths; i++) {
+            if (ctx->paths[i].sender_idx == s &&
+                ctx->paths[i].receiver_idx == new_receiver &&
+                ctx->paths[i].status == DIDAQT_PATH_AVAILABLE) {
+                ctx->paths[i].status = DIDAQT_PATH_USED;
+                break;
+            }
+        }
+
+        mark_failover_time(ctx, s);
+    }
+
+    /* ONE switch update using the representative's old/new paths. */
+    execute_failover(ctx, ctx->nodes[rep].sender_id,
+                     &ctx->paths[rep_old], &ctx->paths[rep_new]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -925,14 +1007,15 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
             /* Sender is healthy — confirm any TempFailed paths
              * as truly Failed. */
             confirm_failed(ctx, s);
-        } else {
-            /* Sender missing — initiate failover. */
+        } else if (!in_grace_period(ctx, s)) {
+            /* Sender missing and grace period expired — failover. */
             uint32_t gid = ctx->nodes[s].group_id;
             if (gid != 0)
                 failover_group(ctx, gid);
             else
                 failover_sender(ctx, s, i);
         }
+        /* else: sender missing but within grace period — ignore. */
     }
 
     return DIDAQT_OK;
