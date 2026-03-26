@@ -1033,8 +1033,12 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
 
         if (ctx->sender_dead[s]) {
             /* Auto-revive if the sender reappears in a heartbeat. */
-            if (sender_in_list(sid, sids, scnt))
+            if (sender_in_list(sid, sids, scnt)) {
                 didaqt_ctrl_revive_sender(ctx, sid);
+                /* Set the path to this receiver as Used. */
+                p->status = DIDAQT_PATH_USED;
+                ctx->sender_seen[s] = 1;
+            }
             continue;
         }
 
