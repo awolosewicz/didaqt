@@ -17,13 +17,15 @@
  * Flags:
  *   -f    Faulty mode: alternate between valid and invalid magic
  *         values every packet, simulating intermittent data corruption.
+ *   -1    Send a single faulty packet then resume normal operation.
  *
  * Usage:
- *   ./sender [-f] <interface> <dst_mac> <sender_id> [vlan_id]
+ *   ./sender [-f|-1] <interface> <dst_mac> <sender_id> [vlan_id]
  *
  * Example:
  *   ./sender eth0 00:11:22:33:44:55 1 100
  *   ./sender -f eth0 00:11:22:33:44:55 1 100
+ *   ./sender -1 eth0 00:11:22:33:44:55 1 100
  *
  * Build (on a Linux host):
  *   gcc -O2 -Wall -o sender sender.c
@@ -172,17 +174,22 @@ static int build_frame(uint8_t *frame,
 
 int main(int argc, char **argv)
 {
-    /* Parse optional -f flag. */
-    int faulty = 0;
+    /* Parse optional flags. */
+    int faulty = 0;       /* -f: alternate every packet */
+    int single_fault = 0; /* -1: one bad packet then normal */
     if (argc > 1 && strcmp(argv[1], "-f") == 0) {
         faulty = 1;
+        argv++;
+        argc--;
+    } else if (argc > 1 && strcmp(argv[1], "-1") == 0) {
+        single_fault = 1;
         argv++;
         argc--;
     }
 
     if (argc < 4 || argc > 5) {
         fprintf(stderr,
-                "Usage: %s [-f] <interface> <dst_mac> <sender_id> [vlan_id]\n",
+                "Usage: %s [-f|-1] <interface> <dst_mac> <sender_id> [vlan_id]\n",
                 argv[0]);
         return 1;
     }
@@ -243,7 +250,7 @@ int main(int argc, char **argv)
     uint8_t frame_bad[FRAME_LEN];
     build_frame(frame_good, src_mac, dst_mac, sender_id, vlan_id);
 
-    if (faulty) {
+    if (faulty || single_fault) {
         /* Build a second template with an invalid magic value. */
         memcpy(frame_bad, frame_good, FRAME_LEN);
         int use_vlan = (vlan_id > 0);
@@ -256,16 +263,21 @@ int main(int argc, char **argv)
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
+    const char *mode = faulty ? " [FAULTY]" : single_fault ? " [SINGLE-FAULT]" : "";
     printf("sender %u: sending %d-byte frames on %s -> %s (vlan %u)%s\n",
-           sender_id, FRAME_LEN, ifname, dst_mac_s, vlan_id,
-           faulty ? " [FAULTY]" : "");
+           sender_id, FRAME_LEN, ifname, dst_mac_s, vlan_id, mode);
 
     /* --- Transmit loop --- */
     uint64_t tx_count = 0;
 
     while (running) {
-        uint8_t *frame = (faulty && (tx_count & 1))
-                       ? frame_bad : frame_good;
+        uint8_t *frame;
+        if (faulty && (tx_count & 1))
+            frame = frame_bad;
+        else if (single_fault && tx_count == 0)
+            frame = frame_bad;
+        else
+            frame = frame_good;
         ssize_t n = send(sockfd, frame, FRAME_LEN, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
