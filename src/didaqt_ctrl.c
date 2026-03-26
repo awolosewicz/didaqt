@@ -715,6 +715,18 @@ static int in_grace_period(const didaqt_ctrl_ctx *ctx, int sender_idx)
     return elapsed_ns < FAILOVER_GRACE_NS;
 }
 
+/* Recycle Failed paths back to Available for a sender.
+ * TempFailed paths are NOT recycled — if every failover attempt
+ * for a sender fails (all paths go TempFailed), the sender must
+ * be assumed dead. */
+static void recycle_failed(didaqt_ctrl_ctx *ctx, int sender_idx)
+{
+    for (int i = 0; i < ctx->num_paths; i++)
+        if (ctx->paths[i].sender_idx == sender_idx &&
+            ctx->paths[i].status == DIDAQT_PATH_FAILED)
+            ctx->paths[i].status = DIDAQT_PATH_AVAILABLE;
+}
+
 /* Perform failover for a single (ungrouped) sender. */
 static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
                             int old_path_idx)
@@ -725,17 +737,19 @@ static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
     old->status = DIDAQT_PATH_TEMP_FAILED;
 
     int new_idx = first_available(ctx, sender_idx);
+    if (new_idx < 0) {
+        /* No Available paths — recycle Failed (not TempFailed) and retry. */
+        recycle_failed(ctx, sender_idx);
+        new_idx = first_available(ctx, sender_idx);
+    }
+
     if (new_idx >= 0) {
         ctx->paths[new_idx].status = DIDAQT_PATH_USED;
         execute_failover(ctx, sid, old, &ctx->paths[new_idx]);
         mark_failover_time(ctx, sender_idx);
     } else {
+        /* Still nothing — all paths are TempFailed, sender is dead. */
         ctx->sender_dead[sender_idx] = 1;
-        for (int i = 0; i < ctx->num_paths; i++) {
-            if (ctx->paths[i].sender_idx == sender_idx &&
-                ctx->paths[i].status == DIDAQT_PATH_TEMP_FAILED)
-                ctx->paths[i].status = DIDAQT_PATH_AVAILABLE;
-        }
         fprintf(stderr, "sender '%s' (id %lu): all paths exhausted, "
                 "sender marked dead\n",
                 ctx->nodes[sender_idx].name, (unsigned long)sid);
@@ -771,16 +785,21 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id)
     /* Find the new receiver via the representative's Available paths. */
     int rep_new = first_available(ctx, rep);
     if (rep_new < 0) {
-        /* All paths exhausted — mark entire group dead. */
+        /* No Available — recycle Failed (not TempFailed) for the
+         * entire group and retry. */
+        for (int s = 0; s < ctx->num_nodes; s++) {
+            if (!node_is_sender(&ctx->nodes[s])) continue;
+            if (ctx->nodes[s].group_id != group_id) continue;
+            recycle_failed(ctx, s);
+        }
+        rep_new = first_available(ctx, rep);
+    }
+    if (rep_new < 0) {
+        /* Still nothing — all paths are TempFailed, group is dead. */
         for (int s = 0; s < ctx->num_nodes; s++) {
             if (!node_is_sender(&ctx->nodes[s])) continue;
             if (ctx->nodes[s].group_id != group_id) continue;
             ctx->sender_dead[s] = 1;
-            for (int i = 0; i < ctx->num_paths; i++) {
-                if (ctx->paths[i].sender_idx == s &&
-                    ctx->paths[i].status == DIDAQT_PATH_TEMP_FAILED)
-                    ctx->paths[i].status = DIDAQT_PATH_AVAILABLE;
-            }
         }
         fprintf(stderr, "group %u: all paths exhausted\n", group_id);
         return;
