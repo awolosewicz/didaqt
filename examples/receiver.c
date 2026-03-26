@@ -63,10 +63,19 @@ static void handle_signal(int sig)
 /*  Per-sender tracking                                             */
 /* --------------------------------------------------------------- */
 
+typedef enum {
+    STAT_OK,
+    STAT_FAULT,
+    STAT_MISSED,
+} sender_status;
+
 typedef struct {
-    uint32_t s_id;
-    uint64_t valid;
-    uint64_t invalid;
+    uint32_t      s_id;
+    uint64_t      valid;
+    uint64_t      invalid;
+    uint64_t      prev_valid;     /* snapshot at last display refresh */
+    uint64_t      prev_invalid;
+    sender_status status;
 } sender_stat;
 
 static sender_stat tracked[MAX_TRACKED];
@@ -81,9 +90,32 @@ static sender_stat *get_sender(uint32_t s_id)
         sender_stat *s = &tracked[num_tracked++];
         memset(s, 0, sizeof(*s));
         s->s_id = s_id;
+        s->status = STAT_MISSED;
         return s;
     }
     return NULL;
+}
+
+/* Update statuses based on activity since last refresh. */
+static void update_statuses(void)
+{
+    for (int i = 0; i < num_tracked; i++) {
+        sender_stat *s = &tracked[i];
+        uint64_t new_valid   = s->valid   - s->prev_valid;
+        uint64_t new_invalid = s->invalid - s->prev_invalid;
+
+        if (new_invalid > 0)
+            s->status = STAT_FAULT;
+        else if (new_valid > 0)
+            s->status = STAT_OK;
+        else
+            s->status = STAT_MISSED;
+        /* If no new frames at all, status persists from previous. */
+        /* MISSED only applies when we had a refresh with zero new frames. */
+
+        s->prev_valid   = s->valid;
+        s->prev_invalid = s->invalid;
+    }
 }
 
 /* --------------------------------------------------------------- */
@@ -93,7 +125,8 @@ static sender_stat *get_sender(uint32_t s_id)
 static void draw_display(uint32_t receiver_id, const char *ifname,
                          uint64_t rx_total)
 {
-    /* Move cursor to home position (no clear — reduces flicker). */
+    update_statuses();
+
     printf("\033[H");
 
     printf("\033[1m  DiDAQt Receiver %u\033[0m — %s\033[K\n",
@@ -103,35 +136,33 @@ static void draw_display(uint32_t receiver_id, const char *ifname,
            "Sender", "Valid", "Invalid", "Status");
     printf("  ──────────────────────────────────────────────\033[K\n");
 
-    int healthy = 0, faulty = 0;
+    int cnt_ok = 0, cnt_fault = 0, cnt_missed = 0;
     for (int i = 0; i < num_tracked; i++) {
         sender_stat *s = &tracked[i];
-        const char *status;
+        const char *label;
         const char *color;
-        if (s->invalid == 0) {
-            status = "OK";
-            color  = "\033[32m";   /* green */
-            healthy++;
-        } else {
-            status = "FAULT";
-            color  = "\033[31m";   /* red */
-            faulty++;
+        switch (s->status) {
+        case STAT_OK:
+            label = "OK";     color = "\033[32m"; cnt_ok++;     break;
+        case STAT_FAULT:
+            label = "FAULT";  color = "\033[31m"; cnt_fault++;  break;
+        case STAT_MISSED:
+            label = "MISSED"; color = "\033[33m"; cnt_missed++; break;
         }
         printf("  %-8u  %12lu  %12lu  %s%s\033[0m\033[K\n",
                s->s_id,
                (unsigned long)s->valid,
                (unsigned long)s->invalid,
-               color, status);
+               color, label);
     }
 
     printf("  ──────────────────────────────────────────────\033[K\n");
-    printf("  %d sender(s): \033[32m%d OK\033[0m",
-           num_tracked, healthy);
-    if (faulty > 0)
-        printf("  \033[31m%d FAULT\033[0m", faulty);
+    printf("  %d sender(s):", num_tracked);
+    if (cnt_ok > 0)     printf(" \033[32m%d OK\033[0m",      cnt_ok);
+    if (cnt_fault > 0)  printf(" \033[31m%d FAULT\033[0m",   cnt_fault);
+    if (cnt_missed > 0) printf(" \033[33m%d MISSED\033[0m",  cnt_missed);
     printf("\033[K\n");
 
-    /* Clear any leftover lines from a previously larger display. */
     printf("\033[J");
     fflush(stdout);
 }
