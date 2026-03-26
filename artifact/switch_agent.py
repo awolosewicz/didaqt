@@ -199,7 +199,7 @@ while agent_running:
         continue
 
     seq = struct.unpack('!H', data[6:8])[0]
-    payload = data[8:].decode('utf-8', errors='replace').strip()
+    payload = data[8:].decode('utf-8', errors='replace').strip().strip('\x00')
 
     silent = payload == 'KA'
 

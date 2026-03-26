@@ -390,10 +390,9 @@ int main(int argc, char **argv)
     fprintf(stderr, "Listening on UDP port %u — starting display.\n\n",
             hb_port);
 
-    /* Set 1-second receive timeout so we can send keepalives to the
-     * switch when no heartbeats arrive.  This prevents the ICMPv6
-     * path from going cold (which causes latency spikes). */
-    struct timeval hb_tv = { .tv_sec = 1, .tv_usec = 0 };
+    /* Use a short receive timeout so the main loop can send periodic
+     * keepalives to the switch agent between heartbeats. */
+    struct timeval hb_tv = { .tv_sec = 0, .tv_usec = 100000 }; /* 100ms */
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &hb_tv, sizeof(hb_tv));
 
     /* Clear screen and draw initial display. */
@@ -402,6 +401,8 @@ int main(int argc, char **argv)
 
     /* ---- Main loop ---- */
     uint8_t buf[6 + DIDAQT_MAX_SENDERS * 4];
+    struct timespec last_ka;
+    clock_gettime(CLOCK_MONOTONIC, &last_ka);
 
     while (running) {
         struct sockaddr_storage src;
@@ -411,10 +412,15 @@ int main(int argc, char **argv)
                              (struct sockaddr *)&src, &src_len);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* Timeout: send silent keepalive to keep the
-                 * ICMPv6 path warm for fast failover response. */
-                if (sc.sockfd >= 0)
+                /* Check if it's time for a keepalive. */
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                long ka_elapsed = (now.tv_sec  - last_ka.tv_sec) * 1000000000L
+                                + (now.tv_nsec - last_ka.tv_nsec);
+                if (ka_elapsed >= 1000000000L && sc.sockfd >= 0) {
                     switch_conn_send(&sc, "KA", NULL, 0);
+                    last_ka = now;
+                }
                 continue;
             }
             if (errno == EINTR) continue;
@@ -424,6 +430,16 @@ int main(int argc, char **argv)
         if (n < 6) continue;
 
         didaqt_ctrl_process_heartbeat(buf, (size_t)n, ctx);
+
+        /* Send a keepalive if 1 second has passed since the last one. */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long ka_elapsed = (now.tv_sec  - last_ka.tv_sec) * 1000000000L
+                        + (now.tv_nsec - last_ka.tv_nsec);
+        if (ka_elapsed >= 1000000000L && sc.sockfd >= 0) {
+            switch_conn_send(&sc, "KA", NULL, 0);
+            last_ka = now;
+        }
 
         /* Redraw after each heartbeat. */
         draw_display(hb_port);
