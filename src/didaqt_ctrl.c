@@ -1029,8 +1029,14 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
         if (p->status != DIDAQT_PATH_USED) continue;
 
         int s = p->sender_idx;
-        if (ctx->sender_dead[s]) continue;
         uint64_t sid = ctx->nodes[s].sender_id;
+
+        if (ctx->sender_dead[s]) {
+            /* Auto-revive if the sender reappears in a heartbeat. */
+            if (sender_in_list(sid, sids, scnt))
+                didaqt_ctrl_revive_sender(ctx, sid);
+            continue;
+        }
 
         if (sender_in_list(sid, sids, scnt)) {
             ctx->sender_seen[s] = 1;
