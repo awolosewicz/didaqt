@@ -1,10 +1,11 @@
 """
 switch_agent.py — Runs inside bfrt_python on the Tofino switch.
 
-Listens for ICMPv6 echo requests from the DiDAQt controller and
-translates them into bfrt table operations on the l2_forward table.
-Uses ICMPv6 because FABRIC's management plane allows ICMP but blocks
-arbitrary TCP/UDP between nodes.
+Installs initial L2 forwarding rules, then listens for ICMPv6 echo
+requests from the DiDAQt controller and translates them into bfrt
+table operations.  Runs as a single bfrt_python session so the
+agent can see the entries it installed (avoids cross-session cache
+issues).
 
 Protocol:
   Controller sends ICMPv6 echo request (type 128) with:
@@ -14,14 +15,11 @@ Protocol:
     - Same identifier and sequence
     - Payload: response (e.g., "OK 1234" or "PONG")
 
-The kernel also auto-replies with the original payload echoed back;
-the controller distinguishes agent replies by payload prefix.
-
 To stop the agent (since ctrl-c is intercepted by switchd):
   - Send a QUIT command via ICMPv6 from the controller
   - Or: touch /tmp/switch_agent_stop
 
-Run with (inside bfshell session):
+Run with (inside bfshell session, after enabling ports):
   bfrt_python /tmp/switch_agent.py
 
 Requires root (raw sockets).
@@ -30,20 +28,21 @@ import socket
 import struct
 import time
 import os
+import io
+import sys
+import json
 
 ICMP6_ECHO_REQUEST = 128
 ICMP6_ECHO_REPLY = 129
 DIDAQT_ICMP_ID = 0xDDAA
 STOP_FILE = '/tmp/switch_agent_stop'
+RULES_CONF = '/tmp/switch_agent_rules.json'
 
 # Clean up stale stop file from previous runs.
 if os.path.exists(STOP_FILE):
     os.unlink(STOP_FILE)
 
 # ---- Discover port mapping (logical name -> dev_port) ----
-# Suppress the spurious "entry_scope_attributes_allocate failed" warning
-# that port.port.dump() prints to stdout on some SDE versions.
-import io, sys
 _old_stdout = sys.stdout
 sys.stdout = io.StringIO()
 try:
@@ -70,29 +69,41 @@ def resolve_port(logical):
     """Map a logical port number to a Tofino dev_port."""
     return port_map.get(str(logical))
 
-# Build a lookup from dev_port -> (dst_addr, vlan_id) from the initial
-# table state.  This avoids relying on dump(return_ents=True) at runtime,
-# which can fail silently on some SDE versions.
+# ---- Install initial forwarding rules ----
+# Rules config is a JSON file written by the notebook:
+#   [{"logical_port": "3", "dst_addr": 1234567890, "vlan_id": 0}, ...]
 fwd_table = {}   # dev_port -> (dst_addr_int, vlan_id)
 
-def snapshot_fwd_table():
-    """Capture current forwarding table entries into fwd_table."""
-    global fwd_table
-    fwd_table.clear()
-    try:
-        entries = l2_fwd.dump(return_ents=True)
-        if entries:
-            for ent in entries:
-                dp = ent.data.get('port') or ent.data.get(b'port')
-                dst = ent.key.get('dst_addr') or ent.key.get(b'dst_addr')
-                vid = ent.data.get('vlan_id', ent.data.get(b'vlan_id', 0))
-                if dp is not None and dst is not None:
-                    fwd_table[dp] = (dst, vid)
-        print(f"  fwd_table snapshot: {fwd_table}")
-    except Exception as e:
-        print(f"  fwd_table snapshot failed: {e}")
+if os.path.exists(RULES_CONF):
+    with open(RULES_CONF) as f:
+        rules = json.load(f)
+    for rule in rules:
+        dp = resolve_port(rule['logical_port'])
+        if dp is None:
+            print(f"  WARNING: unknown logical port {rule['logical_port']}")
+            continue
+        dst = rule['dst_addr']
+        vid = rule.get('vlan_id', 0)
+        try:
+            l2_fwd.add_with_forward(dst_addr=dst, port=dp, vlan_id=vid)
+        except Exception as e:
+            # Entry may already exist from a previous run; try delete+add.
+            try:
+                l2_fwd.delete(dst_addr=dst)
+                l2_fwd.add_with_forward(dst_addr=dst, port=dp, vlan_id=vid)
+            except Exception as e2:
+                print(f"  ERROR adding rule dst=0x{dst:x} port={dp}: {e2}")
+                continue
+        fwd_table[dp] = (dst, vid)
+        print(f"  rule: dst=0x{dst:x} -> port={dp} (logical {rule['logical_port']}) vlan={vid}")
+    bfrt.complete_operations()
+    print(f"switch_agent: {len(fwd_table)} forwarding rules installed")
+else:
+    print(f"switch_agent: WARNING: {RULES_CONF} not found, no rules installed")
 
-snapshot_fwd_table()
+l2_fwd.dump(table=True)
+
+# ---- Update handler ----
 
 def handle_update(sender_id, cur_in, cur_out, new_in, new_out):
     """Apply a forwarding table change for a failover."""
@@ -104,14 +115,12 @@ def handle_update(sender_id, cur_in, cur_out, new_in, new_out):
     if dev_new_out is None:
         return False, "unknown new egress port"
 
-    try:
-        # Look up the entry from our cached table.
-        if dev_cur_out is None or dev_cur_out not in fwd_table:
-            return False, f"no entry for dev_port {dev_cur_out}"
+    if dev_cur_out is None or dev_cur_out not in fwd_table:
+        return False, f"no entry for dev_port {dev_cur_out}"
 
+    try:
         dst, vlan = fwd_table[dev_cur_out]
 
-        # Delete old entry and add with new egress port.
         l2_fwd.delete(dst_addr=dst)
         l2_fwd.add_with_forward(
             dst_addr=dst,
@@ -120,7 +129,6 @@ def handle_update(sender_id, cur_in, cur_out, new_in, new_out):
         )
         bfrt.complete_operations()
 
-        # Update our cache to reflect the change.
         del fwd_table[dev_cur_out]
         fwd_table[dev_new_out] = (dst, vlan)
 
@@ -158,14 +166,13 @@ def handle_command(cmd):
 
 # ---- ICMPv6 raw socket ----
 sock = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
-sock.settimeout(5.0)  # check stop file periodically
+sock.settimeout(5.0)
 
 print(f"switch_agent: listening for ICMPv6 echo requests (id=0x{DIDAQT_ICMP_ID:04X})")
 print(f"switch_agent: send QUIT command or 'touch {STOP_FILE}' to exit")
 
 agent_running = True
 while agent_running:
-    # Check stop file
     if os.path.exists(STOP_FILE):
         print("switch_agent: stop file detected, exiting")
         break
@@ -180,7 +187,6 @@ while agent_running:
     if len(data) < 8:
         continue
 
-    # Parse ICMPv6 header
     icmp_type = data[0]
     if icmp_type != ICMP6_ECHO_REQUEST:
         continue
@@ -194,11 +200,8 @@ while agent_running:
 
     print(f"  recv: seq={seq} cmd='{payload}' from {addr[0]}")
 
-    # Process command
     response, quit_flag = handle_command(payload)
 
-    # Build echo reply: type=129, code=0, cksum=0 (kernel fills),
-    # same id and seq, response as payload.
     reply = struct.pack('!BBHHH',
                         ICMP6_ECHO_REPLY, 0, 0,
                         DIDAQT_ICMP_ID, seq)
