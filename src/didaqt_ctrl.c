@@ -1017,6 +1017,23 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
     int recv_idx = find_receiver_by_id(ctx, rid);
     if (recv_idx < 0) return DIDAQT_ERR;
 
+    /* Auto-revive dead senders that reappear in this heartbeat.
+     * This is a separate pass because dead senders have no USED
+     * paths and would be skipped by the main loop below. */
+    for (int i = 0; i < ctx->num_paths; i++) {
+        ctrl_path *p = &ctx->paths[i];
+        if (p->receiver_idx != recv_idx) continue;
+        int s = p->sender_idx;
+        if (!ctx->sender_dead[s]) continue;
+        if (!node_is_sender(&ctx->nodes[s])) continue;
+        uint64_t sid = ctx->nodes[s].sender_id;
+        if (sender_in_list(sid, sids, scnt)) {
+            didaqt_ctrl_revive_sender(ctx, sid);
+            p->status = DIDAQT_PATH_USED;
+            ctx->sender_seen[s] = 1;
+        }
+    }
+
     /* Track which groups have already been failed over in this
      * heartbeat to avoid processing the same group multiple times. */
     uint32_t handled_groups[MAX_NODES];
@@ -1029,18 +1046,8 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
         if (p->status != DIDAQT_PATH_USED) continue;
 
         int s = p->sender_idx;
+        if (ctx->sender_dead[s]) continue;
         uint64_t sid = ctx->nodes[s].sender_id;
-
-        if (ctx->sender_dead[s]) {
-            /* Auto-revive if the sender reappears in a heartbeat. */
-            if (sender_in_list(sid, sids, scnt)) {
-                didaqt_ctrl_revive_sender(ctx, sid);
-                /* Set the path to this receiver as Used. */
-                p->status = DIDAQT_PATH_USED;
-                ctx->sender_seen[s] = 1;
-            }
-            continue;
-        }
 
         if (sender_in_list(sid, sids, scnt)) {
             ctx->sender_seen[s] = 1;
