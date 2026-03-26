@@ -101,6 +101,11 @@ struct didaqt_ctrl_ctx {
      * Set when all paths are exhausted; cleared by revive. */
     int          sender_dead[MAX_NODES];
 
+    /* Per-sender "seen" flag.  A sender must appear in at least one
+     * heartbeat before its absence can trigger failover.  This
+     * prevents false failovers during startup. */
+    int          sender_seen[MAX_NODES];
+
     /* Per-sender last-failover timestamp.  Missing-sender events are
      * ignored for FAILOVER_GRACE_NS after a failover to allow traffic
      * to reach the new receiver. */
@@ -1004,18 +1009,20 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
         uint64_t sid = ctx->nodes[s].sender_id;
 
         if (sender_in_list(sid, sids, scnt)) {
-            /* Sender is healthy — confirm any TempFailed paths
-             * as truly Failed. */
+            /* Sender is healthy — mark as seen and confirm any
+             * TempFailed paths as truly Failed. */
+            ctx->sender_seen[s] = 1;
             confirm_failed(ctx, s);
-        } else if (!in_grace_period(ctx, s)) {
-            /* Sender missing and grace period expired — failover. */
+        } else if (ctx->sender_seen[s] && !in_grace_period(ctx, s)) {
+            /* Sender was previously seen, is now missing, and the
+             * grace period has expired — initiate failover. */
             uint32_t gid = ctx->nodes[s].group_id;
             if (gid != 0)
                 failover_group(ctx, gid);
             else
                 failover_sender(ctx, s, i);
         }
-        /* else: sender missing but within grace period — ignore. */
+        /* else: sender never seen or within grace period — ignore. */
     }
 
     return DIDAQT_OK;
@@ -1069,6 +1076,7 @@ int didaqt_ctrl_revive_sender(didaqt_ctrl_ctx *ctx, uint64_t sender_id)
     if (s < 0) return DIDAQT_ERR;
 
     ctx->sender_dead[s] = 0;
+    ctx->sender_seen[s] = 0;
 
     /* Reset all FAILED and TEMP_FAILED paths for this sender to
      * AVAILABLE so failover can be attempted again. */
