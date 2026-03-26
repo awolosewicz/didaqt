@@ -147,6 +147,9 @@ def handle_command(cmd):
     if not parts:
         return "ERR empty", False
 
+    if parts[0] == 'KA':
+        return 'OK', False    # keepalive — silent, no log
+
     if parts[0] == 'PING':
         return 'PONG', False
 
@@ -198,7 +201,10 @@ while agent_running:
     seq = struct.unpack('!H', data[6:8])[0]
     payload = data[8:].decode('utf-8', errors='replace').strip()
 
-    print(f"  recv: seq={seq} cmd='{payload}' from {addr[0]}")
+    silent = payload == 'KA'
+
+    if not silent:
+        print(f"  recv: seq={seq} cmd='{payload}' from {addr[0]}")
 
     response, quit_flag = handle_command(payload)
 
@@ -208,7 +214,9 @@ while agent_running:
     reply += response.encode('utf-8')
 
     sock.sendto(reply, addr)
-    print(f"  sent: seq={seq} resp='{response}' to {addr[0]}")
+
+    if not silent:
+        print(f"  sent: seq={seq} resp='{response}' to {addr[0]}")
 
     if quit_flag:
         print("switch_agent: QUIT received, exiting")

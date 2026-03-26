@@ -390,6 +390,12 @@ int main(int argc, char **argv)
     fprintf(stderr, "Listening on UDP port %u — starting display.\n\n",
             hb_port);
 
+    /* Set 1-second receive timeout so we can send keepalives to the
+     * switch when no heartbeats arrive.  This prevents the ICMPv6
+     * path from going cold (which causes latency spikes). */
+    struct timeval hb_tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &hb_tv, sizeof(hb_tv));
+
     /* Clear screen and draw initial display. */
     printf("\033[2J");
     draw_display(hb_port);
@@ -404,6 +410,13 @@ int main(int argc, char **argv)
         ssize_t n = recvfrom(sockfd, buf, sizeof(buf), 0,
                              (struct sockaddr *)&src, &src_len);
         if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Timeout: send silent keepalive to keep the
+                 * ICMPv6 path warm for fast failover response. */
+                if (sc.sockfd >= 0)
+                    switch_conn_send(&sc, "KA", NULL, 0);
+                continue;
+            }
             if (errno == EINTR) continue;
             perror("recvfrom");
             break;
