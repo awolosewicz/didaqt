@@ -94,10 +94,14 @@ struct didaqt_ctrl_ctx {
     /* Post-failover grace period in nanoseconds. */
     long         grace_period_ns;
 
+    /* Consecutive missed heartbeats required to trigger failover. */
+    int          miss_threshold;
+
     /* Per-node arrays (allocated to num_nodes after YAML parse). */
     int              *sender_dead;
     int              *sender_seen;           /* ever seen in any heartbeat */
     int              *sender_seen_at_recv;   /* seen at current receiver since last failover */
+    int              *miss_count;            /* consecutive heartbeats missed */
     struct timespec  *last_failover;
 
     ctrl_handler *handlers;
@@ -808,6 +812,7 @@ static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
         }
         mark_failover_time(ctx, sender_idx);
         ctx->sender_seen_at_recv[sender_idx] = 0;
+        ctx->miss_count[sender_idx] = 0;
     } else {
         /* Still nothing — all paths are TempFailed, sender is dead. */
         ctx->sender_dead[sender_idx] = 1;
@@ -905,6 +910,7 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id)
 
         mark_failover_time(ctx, s);
         ctx->sender_seen_at_recv[s] = 0;
+        ctx->miss_count[s] = 0;
     }
 
     /* ONE switch update using the representative's old/new paths. */
@@ -930,6 +936,7 @@ int didaqt_ctrl_init_ctx(didaqt_ctrl_ctx **ctx)
     if (!c) return DIDAQT_ERR;
 
     c->grace_period_ns = DIDAQT_DEFAULT_GRACE_PERIOD_NS;
+    c->miss_threshold  = DIDAQT_DEFAULT_MISS_THRESHOLD;
 
     *ctx = c;
     return DIDAQT_OK;
@@ -942,6 +949,13 @@ int didaqt_ctrl_set_grace_period(didaqt_ctrl_ctx *ctx, long grace_ns)
     return DIDAQT_OK;
 }
 
+int didaqt_ctrl_set_miss_threshold(didaqt_ctrl_ctx *ctx, int threshold)
+{
+    if (!ctx || threshold < 1) return DIDAQT_ERR;
+    ctx->miss_threshold = threshold;
+    return DIDAQT_OK;
+}
+
 /* Allocate per-node runtime arrays after YAML parse. */
 static int alloc_node_arrays(didaqt_ctrl_ctx *ctx)
 {
@@ -949,9 +963,11 @@ static int alloc_node_arrays(didaqt_ctrl_ctx *ctx)
     ctx->sender_dead         = calloc(n, sizeof(int));
     ctx->sender_seen         = calloc(n, sizeof(int));
     ctx->sender_seen_at_recv = calloc(n, sizeof(int));
+    ctx->miss_count          = calloc(n, sizeof(int));
     ctx->last_failover       = calloc(n, sizeof(struct timespec));
     if (!ctx->sender_dead || !ctx->sender_seen ||
-        !ctx->sender_seen_at_recv || !ctx->last_failover)
+        !ctx->sender_seen_at_recv || !ctx->miss_count ||
+        !ctx->last_failover)
         return DIDAQT_ERR;
     return DIDAQT_OK;
 }
@@ -1080,8 +1096,13 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
         if (sender_in_list(sid, sids, scnt)) {
             ctx->sender_seen[s] = 1;
             ctx->sender_seen_at_recv[s] = 1;
+            ctx->miss_count[s] = 0;
             confirm_failed(ctx, s);
         } else if (ctx->sender_seen[s] && !in_grace_period(ctx, s)) {
+            ctx->miss_count[s]++;
+            if (ctx->miss_count[s] < ctx->miss_threshold)
+                continue;
+
             uint32_t gid = ctx->nodes[s].group_id;
 
             /* If this sender was never seen at its current receiver
@@ -1182,6 +1203,7 @@ int didaqt_ctrl_revive_sender(didaqt_ctrl_ctx *ctx, uint64_t sender_id)
     ctx->sender_dead[s] = 0;
     ctx->sender_seen[s] = 0;
     ctx->sender_seen_at_recv[s] = 0;
+    ctx->miss_count[s] = 0;
 
     /* Reset all FAILED and TEMP_FAILED paths for this sender to
      * AVAILABLE so failover can be attempted again. */
@@ -1221,6 +1243,7 @@ void didaqt_ctrl_destroy(didaqt_ctrl_ctx *ctx)
     free(ctx->sender_dead);
     free(ctx->sender_seen);
     free(ctx->sender_seen_at_recv);
+    free(ctx->miss_count);
     free(ctx->last_failover);
     free(ctx->handlers);
     free(ctx);

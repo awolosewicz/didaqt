@@ -73,6 +73,7 @@ typedef enum {
 
 /* Default controller settings. */
 #define DIDAQT_DEFAULT_GRACE_PERIOD_NS 1000000000L  /* 1 second */
+#define DIDAQT_DEFAULT_MISS_THRESHOLD  3
 
 /* Opaque controller context. */
 typedef struct didaqt_ctrl_ctx didaqt_ctrl_ctx;
@@ -111,6 +112,13 @@ int didaqt_ctrl_init_ctx(didaqt_ctrl_ctx **ctx);
 int didaqt_ctrl_set_grace_period(didaqt_ctrl_ctx *ctx, long grace_ns);
 
 /*
+ * didaqt_ctrl_set_miss_threshold — Set the number of consecutive
+ * heartbeats a sender must be absent from before triggering failover.
+ * Default: DIDAQT_DEFAULT_MISS_THRESHOLD (3).
+ */
+int didaqt_ctrl_set_miss_threshold(didaqt_ctrl_ctx *ctx, int threshold);
+
+/*
  * didaqt_ctrl_process_topology — Parse a YAML topology file and
  * run static reachability analysis.
  *
@@ -131,7 +139,9 @@ int didaqt_ctrl_register_handler(didaqt_ctrl_ctx *ctx,
 
 /*
  * didaqt_ctrl_process_heartbeat — Feed a received heartbeat packet
- * to the controller.  Triggers failover logic if senders are missing.
+ * to the controller.  Triggers failover logic if senders are missing
+ * from a configurable number of consecutive heartbeats (default 3,
+ * see set_miss_threshold).
  *
  * After a failover, the affected sender's absence is ignored for a
  * configurable grace period (default 1s, see set_grace_period) to
