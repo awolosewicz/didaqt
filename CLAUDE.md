@@ -66,7 +66,7 @@ Failover flow: USED → TEMP_FAILED (on miss) → FAILED (confirmed by heartbeat
 
 1. Run notebook cells through switch configuration
 2. SSH into switch, run switchd + `bfrt_python /tmp/switch_agent.py`
-3. Start controller: `sudo ./build/controller topology.yaml 9000 <switch_ipv6>`
-4. Start receivers: `sudo ./build/receiver <iface> <id> <ctrl_ip> 9000`
+3. Start controller: `sudo ./build/controller [-m miss] [-g grace_ms] topology.yaml 9000 [switch_ipv6]`
+4. Start receivers: `sudo ./build/receiver [-i interval_ms] <iface> <id> <ctrl_ip> 9000`
 5. Start senders: `sudo ./build/sender <iface> <dst_mac> <id>`
 6. Inject fault: `sudo ./build/sender -o <iface> <dst_mac> <id>` (one bad packet)

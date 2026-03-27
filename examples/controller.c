@@ -9,7 +9,12 @@
  * scrolling log of failover events.
  *
  * Usage:
- *   ./controller <topology.yaml> <heartbeat_port> [switch_ipv6]
+ *   ./controller [-m miss] [-g grace_ms] <topology.yaml>
+ *                <heartbeat_port> [switch_ipv6]
+ *
+ * Options:
+ *   -m miss      Consecutive missed heartbeats before failover (default 3)
+ *   -g grace_ms  Post-failover grace period in ms (default 1000)
  *
  * Requires: CAP_NET_RAW for ICMPv6 switch communication (run with
  * sudo); not needed in log-only mode (no switch_ipv6 argument).
@@ -314,10 +319,27 @@ static int switch_handler(uint64_t sender_id,
 
 int main(int argc, char **argv)
 {
+    int miss_threshold = DIDAQT_DEFAULT_MISS_THRESHOLD;
+    long grace_ms      = DIDAQT_DEFAULT_GRACE_PERIOD_NS / 1000000L;
+
+    /* Parse optional flags. */
+    while (argc > 1 && argv[1][0] == '-') {
+        if (strcmp(argv[1], "-m") == 0 && argc > 2) {
+            miss_threshold = atoi(argv[2]);
+            argv += 2; argc -= 2;
+        } else if (strcmp(argv[1], "-g") == 0 && argc > 2) {
+            grace_ms = atol(argv[2]);
+            argv += 2; argc -= 2;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[1]);
+            return 1;
+        }
+    }
+
     if (argc < 3 || argc > 4) {
         fprintf(stderr,
-                "Usage: %s <topology.yaml> <heartbeat_port> "
-                "[switch_ipv6]\n", argv[0]);
+                "Usage: %s [-m miss] [-g grace_ms] <topology.yaml> "
+                "<heartbeat_port> [switch_ipv6]\n", argv[0]);
         return 1;
     }
 
@@ -355,6 +377,9 @@ int main(int argc, char **argv)
         switch_conn_close(&sc);
         return 1;
     }
+
+    didaqt_ctrl_set_miss_threshold(ctx, miss_threshold);
+    didaqt_ctrl_set_grace_period(ctx, grace_ms * 1000000L);
 
     fprintf(stderr, "Loading topology: %s\n", topo_path);
     if (didaqt_ctrl_process_topology(topo_path, ctx) != DIDAQT_OK) {

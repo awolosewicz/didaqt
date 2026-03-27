@@ -9,7 +9,11 @@
  * Displays a live terminal UI showing per-sender frame counts.
  *
  * Usage:
- *   ./receiver <interface> <receiver_id> <controller_ip> <controller_port>
+ *   ./receiver [-i interval_ms] <interface> <receiver_id>
+ *              <controller_ip> <controller_port>
+ *
+ * Options:
+ *   -i interval_ms  Heartbeat interval in ms (default 100)
  *
  * Build:
  *   gcc -O2 -Wall -pthread -Iinclude -o receiver \
@@ -188,9 +192,22 @@ static uint32_t sender_id_from_frame(const uint8_t *frame, int l2len)
 
 int main(int argc, char **argv)
 {
+    uint32_t interval_ms = DIDAQT_DEFAULT_HB_INTERVAL_MS;
+
+    /* Parse optional flags. */
+    while (argc > 1 && argv[1][0] == '-') {
+        if (strcmp(argv[1], "-i") == 0 && argc > 2) {
+            interval_ms = (uint32_t)atoi(argv[2]);
+            argv += 2; argc -= 2;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[1]);
+            return 1;
+        }
+    }
+
     if (argc != 5) {
         fprintf(stderr,
-                "Usage: %s <interface> <receiver_id> "
+                "Usage: %s [-i interval_ms] <interface> <receiver_id> "
                 "<controller_ip> <controller_port>\n", argv[0]);
         return 1;
     }
@@ -208,6 +225,10 @@ int main(int argc, char **argv)
     }
     if (didaqt_rx_set_controller(ctx, ctrl_ip, ctrl_port) != DIDAQT_OK) {
         fprintf(stderr, "didaqt_rx_set_controller failed\n");
+        return 1;
+    }
+    if (didaqt_rx_set_interval(ctx, interval_ms) != DIDAQT_OK) {
+        fprintf(stderr, "didaqt_rx_set_interval failed\n");
         return 1;
     }
     if (didaqt_rx_start(ctx) != DIDAQT_OK) {
