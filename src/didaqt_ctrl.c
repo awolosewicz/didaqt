@@ -96,7 +96,8 @@ struct didaqt_ctrl_ctx {
 
     /* Per-node arrays (allocated to num_nodes after YAML parse). */
     int              *sender_dead;
-    int              *sender_seen;
+    int              *sender_seen;           /* ever seen in any heartbeat */
+    int              *sender_seen_at_recv;   /* seen at current receiver since last failover */
     struct timespec  *last_failover;
 
     ctrl_handler *handlers;
@@ -806,6 +807,7 @@ static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
             return;
         }
         mark_failover_time(ctx, sender_idx);
+        ctx->sender_seen_at_recv[sender_idx] = 0;
     } else {
         /* Still nothing — all paths are TempFailed, sender is dead. */
         ctx->sender_dead[sender_idx] = 1;
@@ -866,7 +868,14 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id)
 
     int new_receiver = ctx->paths[rep_new].receiver_idx;
 
-    /* Move ALL senders in the group: Used→TempFailed, Available(new)→Used. */
+    /* Snapshot path statuses before modification for rollback. */
+    didaqt_path_status *saved = malloc(ctx->num_paths
+                                       * sizeof(didaqt_path_status));
+    if (!saved) return;
+    for (int i = 0; i < ctx->num_paths; i++)
+        saved[i] = ctx->paths[i].status;
+
+    /* Move ALL senders in the group: Used→TempFailed, new path→Used. */
     for (int s = 0; s < ctx->num_nodes; s++) {
         if (!node_is_sender(&ctx->nodes[s])) continue;
         if (ctx->nodes[s].group_id != group_id) continue;
@@ -880,49 +889,32 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id)
             }
         }
 
-        /* Activate the path to the new receiver. */
+        /* Activate the path to the new receiver.  The path may be
+         * AVAILABLE (normal case) or TEMP_FAILED/FAILED if this sender
+         * never appeared at the new receiver to confirm a previous
+         * failover (e.g. a dead sender in a group). */
         for (int i = 0; i < ctx->num_paths; i++) {
             if (ctx->paths[i].sender_idx == s &&
-                ctx->paths[i].receiver_idx == new_receiver &&
-                ctx->paths[i].status == DIDAQT_PATH_AVAILABLE) {
+                ctx->paths[i].receiver_idx == new_receiver) {
                 ctx->paths[i].status = DIDAQT_PATH_USED;
                 break;
             }
         }
 
         mark_failover_time(ctx, s);
+        ctx->sender_seen_at_recv[s] = 0;
     }
 
     /* ONE switch update using the representative's old/new paths. */
     if (execute_failover(ctx, ctx->nodes[rep].sender_id,
                          &ctx->paths[rep_old], &ctx->paths[rep_new]) != 0) {
-        /* Switch update failed — rollback ALL group members' path state. */
-        for (int s = 0; s < ctx->num_nodes; s++) {
-            if (!node_is_sender(&ctx->nodes[s])) continue;
-            if (ctx->nodes[s].group_id != group_id) continue;
-
-            /* Restore TempFailed back to Used. */
-            for (int i = 0; i < ctx->num_paths; i++) {
-                if (ctx->paths[i].sender_idx == s &&
-                    ctx->paths[i].status == DIDAQT_PATH_TEMP_FAILED) {
-                    ctx->paths[i].status = DIDAQT_PATH_USED;
-                    break;
-                }
-            }
-            /* Restore new Used back to Available. */
-            for (int i = 0; i < ctx->num_paths; i++) {
-                if (ctx->paths[i].sender_idx == s &&
-                    ctx->paths[i].receiver_idx == new_receiver &&
-                    ctx->paths[i].status == DIDAQT_PATH_USED) {
-                    ctx->paths[i].status = DIDAQT_PATH_AVAILABLE;
-                    break;
-                }
-            }
-        }
+        /* Switch update failed — rollback ALL path statuses. */
+        for (int i = 0; i < ctx->num_paths; i++)
+            ctx->paths[i].status = saved[i];
         fprintf(stderr, "group %u: switch update failed, rollback\n",
                 group_id);
-        return;
     }
+    free(saved);
 }
 
 /* ------------------------------------------------------------------ */
@@ -952,10 +944,12 @@ int didaqt_ctrl_set_grace_period(didaqt_ctrl_ctx *ctx, long grace_ns)
 static int alloc_node_arrays(didaqt_ctrl_ctx *ctx)
 {
     int n = ctx->num_nodes;
-    ctx->sender_dead   = calloc(n, sizeof(int));
-    ctx->sender_seen   = calloc(n, sizeof(int));
-    ctx->last_failover = calloc(n, sizeof(struct timespec));
-    if (!ctx->sender_dead || !ctx->sender_seen || !ctx->last_failover)
+    ctx->sender_dead         = calloc(n, sizeof(int));
+    ctx->sender_seen         = calloc(n, sizeof(int));
+    ctx->sender_seen_at_recv = calloc(n, sizeof(int));
+    ctx->last_failover       = calloc(n, sizeof(struct timespec));
+    if (!ctx->sender_dead || !ctx->sender_seen ||
+        !ctx->sender_seen_at_recv || !ctx->last_failover)
         return DIDAQT_ERR;
     return DIDAQT_OK;
 }
@@ -1047,6 +1041,7 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
 
         didaqt_ctrl_revive_sender(ctx, (uint64_t)sids[si]);
         ctx->sender_seen[s] = 1;
+        ctx->sender_seen_at_recv[s] = 1;
 
         /* Clear any existing USED path for this sender, then activate
          * the path to the receiver that reported it. */
@@ -1082,9 +1077,23 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
 
         if (sender_in_list(sid, sids, scnt)) {
             ctx->sender_seen[s] = 1;
+            ctx->sender_seen_at_recv[s] = 1;
             confirm_failed(ctx, s);
         } else if (ctx->sender_seen[s] && !in_grace_period(ctx, s)) {
             uint32_t gid = ctx->nodes[s].group_id;
+
+            /* If this sender was never seen at its current receiver
+             * since the last failover, the sender itself is dead —
+             * not the path.  Mark it dead individually without
+             * triggering a group failover. */
+            if (!ctx->sender_seen_at_recv[s]) {
+                ctx->sender_dead[s] = 1;
+                fprintf(stderr, "sender '%s' (id %lu): never seen at "
+                        "current receiver, marked dead\n",
+                        ctx->nodes[s].name, (unsigned long)sid);
+                continue;
+            }
+
             if (gid != 0) {
                 /* Skip if this group was already handled. */
                 int already = 0;
@@ -1158,6 +1167,7 @@ int didaqt_ctrl_revive_sender(didaqt_ctrl_ctx *ctx, uint64_t sender_id)
 
     ctx->sender_dead[s] = 0;
     ctx->sender_seen[s] = 0;
+    ctx->sender_seen_at_recv[s] = 0;
 
     /* Reset all FAILED and TEMP_FAILED paths for this sender to
      * AVAILABLE so failover can be attempted again. */
@@ -1196,6 +1206,7 @@ void didaqt_ctrl_destroy(didaqt_ctrl_ctx *ctx)
     }
     free(ctx->sender_dead);
     free(ctx->sender_seen);
+    free(ctx->sender_seen_at_recv);
     free(ctx->last_failover);
     free(ctx->handlers);
     free(ctx);
