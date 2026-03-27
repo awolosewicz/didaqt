@@ -9,6 +9,85 @@
 #include <sys/socket.h>
 #include <time.h>
 
+/*
+ * Hash set for O(1) blocked/scheduled sender lookups.
+ * Open-addressing with linear probing; capacity is always a power of 2.
+ * Entry value 0 = empty (sender_id 0 is reserved/unused).
+ */
+#define HSET_CAP 512   /* must be power of 2, > DIDAQT_MAX_SENDERS */
+
+typedef struct {
+    uint32_t entries[HSET_CAP];
+    int      count;
+} sender_hset;
+
+static void hset_clear(sender_hset *s)
+{
+    memset(s->entries, 0, sizeof(s->entries));
+    s->count = 0;
+}
+
+static int hset_contains(const sender_hset *s, uint32_t id)
+{
+    uint32_t idx = id & (HSET_CAP - 1);
+    for (;;) {
+        uint32_t e = s->entries[idx];
+        if (e == 0)  return 0;
+        if (e == id) return 1;
+        idx = (idx + 1) & (HSET_CAP - 1);
+    }
+}
+
+static int hset_insert(sender_hset *s, uint32_t id)
+{
+    if (s->count >= HSET_CAP / 2) return -1;  /* load factor limit */
+    uint32_t idx = id & (HSET_CAP - 1);
+    for (;;) {
+        uint32_t e = s->entries[idx];
+        if (e == 0) {
+            s->entries[idx] = id;
+            s->count++;
+            return 1;  /* inserted */
+        }
+        if (e == id) return 0;  /* already present */
+        idx = (idx + 1) & (HSET_CAP - 1);
+    }
+}
+
+static void hset_remove(sender_hset *s, uint32_t id)
+{
+    uint32_t idx = id & (HSET_CAP - 1);
+    for (;;) {
+        uint32_t e = s->entries[idx];
+        if (e == 0) return;
+        if (e == id) {
+            /* Remove and re-insert displaced entries. */
+            s->entries[idx] = 0;
+            s->count--;
+            uint32_t j = (idx + 1) & (HSET_CAP - 1);
+            while (s->entries[j] != 0) {
+                uint32_t displaced = s->entries[j];
+                s->entries[j] = 0;
+                s->count--;
+                hset_insert(s, displaced);
+                j = (j + 1) & (HSET_CAP - 1);
+            }
+            return;
+        }
+        idx = (idx + 1) & (HSET_CAP - 1);
+    }
+}
+
+/* Collect all entries from the hash set into a flat array. */
+static int hset_to_array(const sender_hset *s, uint32_t *out)
+{
+    int n = 0;
+    for (int i = 0; i < HSET_CAP; i++)
+        if (s->entries[i] != 0)
+            out[n++] = s->entries[i];
+    return n;
+}
+
 struct didaqt_rx_ctx {
     uint32_t  r_id;
 
@@ -21,15 +100,9 @@ struct didaqt_rx_ctx {
     /* Heartbeat interval. */
     uint32_t  interval_ms;
 
-    /* Scheduled sender IDs for the current interval. */
-    uint32_t  senders[DIDAQT_MAX_SENDERS];
-    int       sender_count;
-
-    /* Blocked sender IDs for the current interval.
-     * Any s_id in this set is excluded from the heartbeat and
-     * cannot be re-added by schedule_heartbeat until the next interval. */
-    uint32_t  blocked[DIDAQT_MAX_SENDERS];
-    int       blocked_count;
+    /* Scheduled and blocked sender sets (hash-based, O(1) operations). */
+    sender_hset senders;
+    sender_hset blocked;
 
     pthread_mutex_t lock;
 
@@ -95,11 +168,9 @@ static void *heartbeat_loop(void *arg)
 
         /* Snapshot and clear the scheduled and blocked sets. */
         pthread_mutex_lock(&ctx->lock);
-        snap_count = ctx->sender_count;
-        if (snap_count > 0)
-            memcpy(snap, ctx->senders, snap_count * sizeof(uint32_t));
-        ctx->sender_count  = 0;
-        ctx->blocked_count = 0;
+        snap_count = hset_to_array(&ctx->senders, snap);
+        hset_clear(&ctx->senders);
+        hset_clear(&ctx->blocked);
         pthread_mutex_unlock(&ctx->lock);
 
         /* Always send a heartbeat — an empty one signals that the
@@ -133,7 +204,6 @@ int didaqt_rx_init_ctx(uint32_t r_id, didaqt_rx_ctx **ctx)
 
     c->r_id          = r_id;
     c->interval_ms   = DIDAQT_DEFAULT_HB_INTERVAL_MS;
-    c->sender_count  = 0;
     c->running       = 0;
     c->sockfd        = -1;
     c->ctrl_addr_set = 0;
@@ -215,31 +285,15 @@ int schedule_heartbeat(uint32_t s_id, didaqt_rx_ctx *ctx)
 
     pthread_mutex_lock(&ctx->lock);
 
-    /* If this sender is blocked for the current interval, ignore. */
-    for (int i = 0; i < ctx->blocked_count; i++) {
-        if (ctx->blocked[i] == s_id) {
-            pthread_mutex_unlock(&ctx->lock);
-            return DIDAQT_OK;
-        }
-    }
-
-    /* Check if already scheduled to avoid duplicates. */
-    for (int i = 0; i < ctx->sender_count; i++) {
-        if (ctx->senders[i] == s_id) {
-            pthread_mutex_unlock(&ctx->lock);
-            return DIDAQT_OK;
-        }
-    }
-
-    if (ctx->sender_count >= DIDAQT_MAX_SENDERS) {
+    if (hset_contains(&ctx->blocked, s_id)) {
         pthread_mutex_unlock(&ctx->lock);
-        return DIDAQT_ERR_FULL;
+        return DIDAQT_OK;
     }
 
-    ctx->senders[ctx->sender_count++] = s_id;
-
+    int rc = hset_insert(&ctx->senders, s_id);
     pthread_mutex_unlock(&ctx->lock);
-    return DIDAQT_OK;
+
+    return (rc < 0) ? DIDAQT_ERR_FULL : DIDAQT_OK;
 }
 
 int deschedule_heartbeat(uint32_t s_id, didaqt_rx_ctx *ctx)
@@ -249,26 +303,8 @@ int deschedule_heartbeat(uint32_t s_id, didaqt_rx_ctx *ctx)
 
     pthread_mutex_lock(&ctx->lock);
 
-    /* Remove from the scheduled set if present. */
-    for (int i = 0; i < ctx->sender_count; i++) {
-        if (ctx->senders[i] == s_id) {
-            ctx->senders[i] = ctx->senders[ctx->sender_count - 1];
-            ctx->sender_count--;
-            break;
-        }
-    }
-
-    /* Add to the blocked set so schedule_heartbeat calls for this
-     * sender are ignored for the remainder of the interval. */
-    int already_blocked = 0;
-    for (int i = 0; i < ctx->blocked_count; i++) {
-        if (ctx->blocked[i] == s_id) {
-            already_blocked = 1;
-            break;
-        }
-    }
-    if (!already_blocked && ctx->blocked_count < DIDAQT_MAX_SENDERS)
-        ctx->blocked[ctx->blocked_count++] = s_id;
+    hset_remove(&ctx->senders, s_id);
+    hset_insert(&ctx->blocked, s_id);
 
     pthread_mutex_unlock(&ctx->lock);
     return DIDAQT_OK;
