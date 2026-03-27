@@ -1018,19 +1018,31 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
     if (recv_idx < 0) return DIDAQT_ERR;
 
     /* Auto-revive dead senders that reappear in this heartbeat.
-     * This is a separate pass because dead senders have no USED
-     * paths and would be skipped by the main loop below. */
-    for (int i = 0; i < ctx->num_paths; i++) {
-        ctrl_path *p = &ctx->paths[i];
-        if (p->receiver_idx != recv_idx) continue;
-        int s = p->sender_idx;
-        if (!ctx->sender_dead[s]) continue;
-        if (!node_is_sender(&ctx->nodes[s])) continue;
-        uint64_t sid = ctx->nodes[s].sender_id;
-        if (sender_in_list(sid, sids, scnt)) {
-            didaqt_ctrl_revive_sender(ctx, sid);
-            p->status = DIDAQT_PATH_USED;
-            ctx->sender_seen[s] = 1;
+     * Iterate over the senders reported in the heartbeat and check
+     * if any are dead.  If so, revive and set their path to this
+     * receiver as USED. */
+    for (int si = 0; si < scnt; si++) {
+        /* Find the sender node by sender_id. */
+        int s = -1;
+        for (int n = 0; n < ctx->num_nodes; n++) {
+            if (node_is_sender(&ctx->nodes[n]) &&
+                ctx->nodes[n].sender_id == (uint64_t)sids[si]) {
+                s = n;
+                break;
+            }
+        }
+        if (s < 0 || !ctx->sender_dead[s]) continue;
+
+        didaqt_ctrl_revive_sender(ctx, (uint64_t)sids[si]);
+        ctx->sender_seen[s] = 1;
+
+        /* Find and activate the path to this receiver. */
+        for (int i = 0; i < ctx->num_paths; i++) {
+            if (ctx->paths[i].sender_idx == s &&
+                ctx->paths[i].receiver_idx == recv_idx) {
+                ctx->paths[i].status = DIDAQT_PATH_USED;
+                break;
+            }
         }
     }
 
