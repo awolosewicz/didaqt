@@ -10,7 +10,7 @@ LIB       = $(BUILD_DIR)/libdidaqt.a
 SRCS = $(wildcard $(SRC_DIR)/*.c)
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
-.PHONY: all clean examples
+.PHONY: all clean examples bench
 
 all: $(LIB)
 
@@ -39,6 +39,13 @@ $(BUILD_DIR)/controller: examples/controller.c $(LIB) | $(BUILD_DIR)
 
 $(BUILD_DIR)/heartbeat_monitor: artifact/heartbeat_monitor.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -O2 -o $@ $<
+
+# --- Benchmarks ---
+
+bench: $(BUILD_DIR)/bench_ctrl
+
+$(BUILD_DIR)/bench_ctrl: benchmarking/bench_ctrl.c $(LIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -O2 -o $@ $< -L$(BUILD_DIR) -ldidaqt -lyaml -lpthread
 
 clean:
 	rm -rf $(BUILD_DIR)

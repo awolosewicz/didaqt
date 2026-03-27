@@ -93,6 +93,7 @@ typedef int (*didaqt_switch_handler_fn)(
 typedef struct {
     int                path_id;
     uint64_t           sender_id;
+    uint32_t           receiver_id;
     char               sender_name[DIDAQT_MAX_NAME];
     char               receiver_name[DIDAQT_MAX_NAME];
     didaqt_path_status status;

@@ -1396,9 +1396,10 @@ int didaqt_ctrl_get_path_statuses(const didaqt_ctrl_ctx *ctx,
     for (int i = 0; i < ctx->num_paths; i++) {
         const ctrl_path *p = &ctx->paths[i];
         didaqt_path_info *pi = &(*out)[i];
-        pi->path_id   = i;
-        pi->sender_id = ctx->nodes[p->sender_idx].sender_id;
-        pi->status    = p->status;
+        pi->path_id     = i;
+        pi->sender_id   = ctx->nodes[p->sender_idx].sender_id;
+        pi->receiver_id = ctx->nodes[p->receiver_idx].receiver_id;
+        pi->status      = p->status;
         strncpy(pi->sender_name,
                 ctx->nodes[p->sender_idx].name, NAME_LEN - 1);
         strncpy(pi->receiver_name,
