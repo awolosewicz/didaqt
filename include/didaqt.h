@@ -98,10 +98,35 @@ typedef struct {
     didaqt_path_status status;
 } didaqt_path_info;
 
+/* Failover event types reported via the event callback. */
+typedef enum {
+    DIDAQT_EVENT_FAILOVER,    /* failover decision + switch update */
+    DIDAQT_EVENT_CONFIRMED,   /* sender confirmed at new receiver  */
+    DIDAQT_EVENT_DEAD,        /* sender marked dead                */
+    DIDAQT_EVENT_REVIVED,     /* dead sender auto-revived          */
+} didaqt_event_type;
+
+typedef struct {
+    didaqt_event_type type;
+    uint64_t sender_id;
+    uint32_t group_id;
+    long     elapsed_ns;  /* FAILOVER: decision time before switch update;
+                             CONFIRMED: time since switch update completed */
+} didaqt_event;
+
+typedef void (*didaqt_event_fn)(const didaqt_event *event, void *user_data);
+
 /*
  * didaqt_ctrl_init_ctx — Allocate a controller context.
  */
 int didaqt_ctrl_init_ctx(didaqt_ctrl_ctx **ctx);
+
+/*
+ * didaqt_ctrl_set_event_callback — Register a callback for failover events.
+ * The callback is invoked synchronously during process_heartbeat.
+ */
+int didaqt_ctrl_set_event_callback(didaqt_ctrl_ctx *ctx,
+                                    didaqt_event_fn fn, void *user_data);
 
 /*
  * didaqt_ctrl_set_grace_period — Set the post-failover grace period

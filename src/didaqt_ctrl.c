@@ -91,6 +91,7 @@ typedef struct {
     int             seen_at_recv;    /* seen at current receiver since last failover */
     int             miss_count;      /* consecutive heartbeats missed */
     struct timespec last_failover;
+    struct timespec failover_initiated_at;  /* for confirmation timing */
 } sender_runtime;
 
 /* Lookup entry for sorted sender_id/receiver_id → node_idx tables. */
@@ -138,11 +139,30 @@ struct didaqt_ctrl_ctx {
     ctrl_handler *handlers;
     int           num_handlers;
     int           max_handlers;
+
+    /* Event callback for failover timing. */
+    didaqt_event_fn event_fn;
+    void           *event_user_data;
 };
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
+
+static long timespec_diff_ns(const struct timespec *a, const struct timespec *b)
+{
+    return (a->tv_sec  - b->tv_sec) * 1000000000L
+         + (a->tv_nsec - b->tv_nsec);
+}
+
+static void fire_event(const didaqt_ctrl_ctx *ctx, didaqt_event_type type,
+                        uint64_t sender_id, uint32_t group_id, long elapsed_ns)
+{
+    if (!ctx->event_fn) return;
+    didaqt_event ev = { .type = type, .sender_id = sender_id,
+                        .group_id = group_id, .elapsed_ns = elapsed_ns };
+    ctx->event_fn(&ev, ctx->event_user_data);
+}
 
 static int find_node(const didaqt_ctrl_ctx *ctx, const char *name)
 {
@@ -939,6 +959,15 @@ static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
 
     if (new_idx >= 0) {
         ctx->paths[new_idx].status = DIDAQT_PATH_USED;
+
+        /* Measure decision time: HB arrival to just before switch update. */
+        struct timespec t_pre;
+        clock_gettime(CLOCK_MONOTONIC, &t_pre);
+        long decision_ns = timespec_diff_ns(&t_pre, now);
+
+        fire_event(ctx, DIDAQT_EVENT_FAILOVER, sid,
+                   ctx->nodes[sender_idx].group_id, decision_ns);
+
         if (execute_failover(ctx, sid, old, &ctx->paths[new_idx]) != 0) {
             /* Switch update failed — rollback path state. */
             old->status = DIDAQT_PATH_USED;
@@ -948,10 +977,16 @@ static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
                     ctx->nodes[sender_idx].name, (unsigned long)sid);
             return;
         }
+
+        /* Record time after switch update for confirmation measurement. */
+        clock_gettime(CLOCK_MONOTONIC,
+                      &ctx->runtime[sender_idx].failover_initiated_at);
         reset_sender_after_failover(ctx, sender_idx, now);
     } else {
         /* Still nothing — all paths are TempFailed, sender is dead. */
         ctx->runtime[sender_idx].dead = 1;
+        fire_event(ctx, DIDAQT_EVENT_DEAD, sid,
+                   ctx->nodes[sender_idx].group_id, 0);
         fprintf(stderr, "sender '%s' (id %lu): all paths exhausted, "
                 "sender marked dead\n",
                 ctx->nodes[sender_idx].name, (unsigned long)sid);
@@ -1006,6 +1041,7 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id,
             if (ctx->nodes[s].group_id != group_id) continue;
             ctx->runtime[s].dead = 1;
         }
+        fire_event(ctx, DIDAQT_EVENT_DEAD, 0, group_id, 0);
         fprintf(stderr, "group %u: all paths exhausted\n", group_id);
         return;
     }
@@ -1056,6 +1092,13 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id,
     }
 
     /* ONE switch update using the representative's old/new paths. */
+    struct timespec t_pre;
+    clock_gettime(CLOCK_MONOTONIC, &t_pre);
+    long decision_ns = timespec_diff_ns(&t_pre, now);
+
+    fire_event(ctx, DIDAQT_EVENT_FAILOVER,
+               ctx->nodes[rep].sender_id, group_id, decision_ns);
+
     if (execute_failover(ctx, ctx->nodes[rep].sender_id,
                          &ctx->paths[rep_old], &ctx->paths[rep_new]) != 0) {
         /* Switch update failed — rollback ALL path statuses. */
@@ -1063,6 +1106,17 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id,
             ctx->paths[i].status = ctx->rollback_buf[i];
         fprintf(stderr, "group %u: switch update failed, rollback\n",
                 group_id);
+        return;
+    }
+
+    /* Record time after switch update for confirmation measurement. */
+    struct timespec t_post;
+    clock_gettime(CLOCK_MONOTONIC, &t_post);
+    for (int s = 0; s < ctx->num_nodes; s++) {
+        if (!node_is_sender(&ctx->nodes[s])) continue;
+        if (ctx->nodes[s].group_id != group_id) continue;
+        if (!ctx->runtime[s].dead)
+            ctx->runtime[s].failover_initiated_at = t_post;
     }
 }
 
@@ -1094,6 +1148,15 @@ int didaqt_ctrl_set_miss_threshold(didaqt_ctrl_ctx *ctx, int threshold)
 {
     if (!ctx || threshold < 1) return DIDAQT_ERR;
     ctx->miss_threshold = threshold;
+    return DIDAQT_OK;
+}
+
+int didaqt_ctrl_set_event_callback(didaqt_ctrl_ctx *ctx,
+                                    didaqt_event_fn fn, void *user_data)
+{
+    if (!ctx) return DIDAQT_ERR;
+    ctx->event_fn        = fn;
+    ctx->event_user_data = user_data;
     return DIDAQT_OK;
 }
 
@@ -1206,6 +1269,8 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
         if (s < 0 || !ctx->runtime[s].dead) continue;
 
         didaqt_ctrl_revive_sender(ctx, (uint64_t)sids[si]);
+        fire_event(ctx, DIDAQT_EVENT_REVIVED, (uint64_t)sids[si],
+                   ctx->nodes[s].group_id, 0);
         ctx->runtime[s].seen = 1;
         ctx->runtime[s].seen_at_recv = 1;
 
@@ -1251,7 +1316,18 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
 
         if (present) {
             rt->seen = 1;
-            rt->seen_at_recv = 1;
+            if (!rt->seen_at_recv) {
+                rt->seen_at_recv = 1;
+                /* Fire confirmation if this follows a failover. */
+                if (rt->failover_initiated_at.tv_sec != 0 ||
+                    rt->failover_initiated_at.tv_nsec != 0) {
+                    long confirm_ns = timespec_diff_ns(
+                        &now, &rt->failover_initiated_at);
+                    fire_event(ctx, DIDAQT_EVENT_CONFIRMED, sid,
+                               ctx->nodes[s].group_id, confirm_ns);
+                    rt->failover_initiated_at = (struct timespec){0, 0};
+                }
+            }
             rt->miss_count = 0;
             confirm_failed(ctx, s);
         } else if (rt->seen && !in_grace_period(ctx, s, &now)) {
@@ -1267,6 +1343,8 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
              * the group to undo the unnecessary failover. */
             if (!rt->seen_at_recv) {
                 rt->dead = 1;
+                fire_event(ctx, DIDAQT_EVENT_DEAD, sid,
+                           ctx->nodes[s].group_id, 0);
                 fprintf(stderr, "sender '%s' (id %lu): never seen at "
                         "current receiver, marked dead\n",
                         ctx->nodes[s].name, (unsigned long)sid);

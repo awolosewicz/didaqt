@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
@@ -54,6 +55,33 @@
 
 #define MAX_TRACKED    256
 #define DISPLAY_INTERVAL_NS 500000000L  /* 500 ms */
+
+#define RX_LOG_LINES    8
+#define RX_LOG_LINE_LEN 100
+
+static char   rx_log[RX_LOG_LINES][RX_LOG_LINE_LEN];
+static int    rx_log_next  = 0;
+static int    rx_log_count = 0;
+
+static void rx_log_event(const char *fmt, ...)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm *tm = localtime(&ts.tv_sec);
+
+    char *line = rx_log[rx_log_next % RX_LOG_LINES];
+    int pos = snprintf(line, RX_LOG_LINE_LEN, "[%02d:%02d:%02d.%03ld] ",
+                       tm->tm_hour, tm->tm_min, tm->tm_sec,
+                       ts.tv_nsec / 1000000L);
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line + pos, RX_LOG_LINE_LEN - pos, fmt, ap);
+    va_end(ap);
+
+    rx_log_next = (rx_log_next + 1) % RX_LOG_LINES;
+    if (rx_log_count < RX_LOG_LINES) rx_log_count++;
+}
 
 static volatile int running = 1;
 
@@ -163,6 +191,18 @@ static void draw_display(uint32_t receiver_id, const char *ifname,
     if (cnt_fault > 0)  printf(" \033[31m%d FAULT\033[0m",   cnt_fault);
     if (cnt_missed > 0) printf(" \033[33m%d MISSED\033[0m",  cnt_missed);
     printf("\033[K\n");
+
+    /* Event log. */
+    printf("  ──────────────────────────────────────────────\033[K\n");
+    printf("  \033[1mEvent Log:\033[0m\033[K\n");
+    int log_start = (rx_log_count < RX_LOG_LINES) ? 0 : rx_log_next;
+    int log_n     = (rx_log_count < RX_LOG_LINES) ? rx_log_count : RX_LOG_LINES;
+    for (int i = 0; i < log_n; i++) {
+        int idx = (log_start + i) % RX_LOG_LINES;
+        printf("  %s\033[K\n", rx_log[idx]);
+    }
+    for (int i = log_n; i < RX_LOG_LINES; i++)
+        printf("  \033[K\n");
 
     printf("\033[J");
     fflush(stdout);
@@ -319,10 +359,22 @@ int main(int argc, char **argv)
             if (rc == DIDAQT_ERR_FULL)
                 fprintf(stderr, "receiver: sender %u: heartbeat schedule "
                         "full, sender will not be tracked\n", s_id);
-            if (ss) ss->valid++;
+            if (ss) {
+                if (ss->status == STAT_FAULT) {
+                    rx_log_event("RECOVERED sender=%u", s_id);
+                    ss->status = STAT_OK;
+                }
+                ss->valid++;
+            }
         } else {
             deschedule_heartbeat(s_id, ctx);
-            if (ss) ss->invalid++;
+            if (ss) {
+                if (ss->status != STAT_FAULT) {
+                    rx_log_event("FAULT sender=%u (bad magic)", s_id);
+                    ss->status = STAT_FAULT;
+                }
+                ss->invalid++;
+            }
         }
 
         /* Refresh display periodically. */

@@ -276,6 +276,38 @@ static void switch_conn_close(switch_conn *sc)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Failover event callback                                            */
+/* ------------------------------------------------------------------ */
+
+static void event_handler(const didaqt_event *ev,
+                           __attribute__((unused)) void *user_data)
+{
+    switch (ev->type) {
+    case DIDAQT_EVENT_FAILOVER:
+        log_event("DECISION sender=%lu group=%u t_decision=%.3fms",
+                  (unsigned long)ev->sender_id, ev->group_id,
+                  ev->elapsed_ns / 1e6);
+        break;
+    case DIDAQT_EVENT_CONFIRMED:
+        log_event("CONFIRMED sender=%lu group=%u t_confirm=%.3fms",
+                  (unsigned long)ev->sender_id, ev->group_id,
+                  ev->elapsed_ns / 1e6);
+        break;
+    case DIDAQT_EVENT_DEAD:
+        if (ev->sender_id)
+            log_event("DEAD sender=%lu group=%u",
+                      (unsigned long)ev->sender_id, ev->group_id);
+        else
+            log_event("DEAD group=%u (all paths exhausted)", ev->group_id);
+        break;
+    case DIDAQT_EVENT_REVIVED:
+        log_event("REVIVED sender=%lu group=%u",
+                  (unsigned long)ev->sender_id, ev->group_id);
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Switch handler                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -287,7 +319,7 @@ static int switch_handler(uint64_t sender_id,
     switch_conn *sc = (switch_conn *)user_data;
 
     if (sc->sockfd < 0) {
-        log_event("FAILOVER sender=%lu (%d,%d)->(%d,%d) [log-only]",
+        log_event("SWITCH sender=%lu (%d,%d)->(%d,%d) [log-only]",
                   (unsigned long)sender_id,
                   cur_in, cur_out, new_in, new_out);
         return 0;
@@ -301,15 +333,15 @@ static int switch_handler(uint64_t sender_id,
     char resp[128] = {0};
     long us = switch_conn_send(sc, cmd, resp, sizeof(resp));
     if (us < 0) {
-        log_event("FAILOVER sender=%lu (%d,%d)->(%d,%d) FAILED",
+        log_event("SWITCH sender=%lu (%d,%d)->(%d,%d) FAILED",
                   (unsigned long)sender_id,
                   cur_in, cur_out, new_in, new_out);
         return -1;
     }
 
-    log_event("FAILOVER sender=%lu (%d,%d)->(%d,%d) rtt=%ldus %s",
+    log_event("SWITCH sender=%lu (%d,%d)->(%d,%d) t_switch=%.3fms rtt=%ldus %s",
               (unsigned long)sender_id,
-              cur_in, cur_out, new_in, new_out, us, resp);
+              cur_in, cur_out, new_in, new_out, us / 2000.0, us, resp);
     return 0;
 }
 
@@ -380,6 +412,7 @@ int main(int argc, char **argv)
 
     didaqt_ctrl_set_miss_threshold(ctx, miss_threshold);
     didaqt_ctrl_set_grace_period(ctx, grace_ms * 1000000L);
+    didaqt_ctrl_set_event_callback(ctx, event_handler, NULL);
 
     fprintf(stderr, "Loading topology: %s\n", topo_path);
     if (didaqt_ctrl_process_topology(topo_path, ctx) != DIDAQT_OK) {
