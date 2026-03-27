@@ -60,7 +60,7 @@ Key patterns for the notebook:
 didaqt_path_status: USED, AVAILABLE, TEMP_FAILED, FAILED
 ```
 
-Failover flow: USED → TEMP_FAILED (on miss) → FAILED (confirmed by heartbeat from new receiver). FAILED paths are recycled to AVAILABLE when no other paths remain. TEMP_FAILED paths are never recycled (all TempFailed = sender dead).
+Failover flow: USED → TEMP_FAILED (on miss) → FAILED (confirmed by heartbeat from new receiver). FAILED paths are recycled to AVAILABLE when no other paths remain. TEMP_FAILED paths are never recycled during normal failover (all TempFailed = sender dead), but are reset to AVAILABLE when a dead sender is revived via auto-revival.
 
 ## Testing the example
 

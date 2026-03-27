@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -34,7 +35,7 @@ struct didaqt_rx_ctx {
 
     /* Background heartbeat thread. */
     pthread_t thread;
-    int       running;
+    atomic_int running;
 };
 
 /* ------------------------------------------------------------------ */
@@ -106,9 +107,11 @@ static void *heartbeat_loop(void *arg)
         int len = build_heartbeat(ctx, snap, snap_count,
                                   pkt, sizeof(pkt));
         if (len > 0) {
-            sendto(ctx->sockfd, pkt, (size_t)len, 0,
-                   (struct sockaddr *)&ctx->ctrl_addr,
-                   ctx->ctrl_addr_len);
+            ssize_t sent = sendto(ctx->sockfd, pkt, (size_t)len, 0,
+                                  (struct sockaddr *)&ctx->ctrl_addr,
+                                  ctx->ctrl_addr_len);
+            if (sent < 0)
+                write(STDERR_FILENO, "didaqt_rx: sendto failed\n", 25);
         }
     }
 

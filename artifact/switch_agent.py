@@ -43,6 +43,7 @@ if os.path.exists(STOP_FILE):
     os.unlink(STOP_FILE)
 
 # ---- Discover port mapping (logical name -> dev_port) ----
+port_dump = None
 _old_stdout = sys.stdout
 sys.stdout = io.StringIO()
 try:
@@ -157,11 +158,14 @@ def handle_command(cmd):
         return 'OK bye', True
 
     if parts[0] == 'UPDATE' and len(parts) == 6:
-        sid    = int(parts[1])
-        ci     = int(parts[2])
-        co     = int(parts[3])
-        ni     = int(parts[4])
-        no     = int(parts[5])
+        try:
+            sid    = int(parts[1])
+            ci     = int(parts[2])
+            co     = int(parts[3])
+            ni     = int(parts[4])
+            no     = int(parts[5])
+        except ValueError:
+            return 'ERR bad params', False
         ok, msg = handle_update(sid, ci, co, ni, no)
         return (f'OK {msg}' if ok else f'ERR {msg}'), False
 
@@ -184,7 +188,9 @@ while agent_running:
         data, addr = sock.recvfrom(4096)
     except socket.timeout:
         continue
-    except Exception:
+    except Exception as e:
+        print(f"switch_agent: recv error: {e}")
+        time.sleep(1)
         continue
 
     if len(data) < 8:
@@ -213,7 +219,10 @@ while agent_running:
                         DIDAQT_ICMP_ID, seq)
     reply += response.encode('utf-8')
 
-    sock.sendto(reply, addr)
+    try:
+        sock.sendto(reply, addr)
+    except Exception as e:
+        print(f"switch_agent: sendto error: {e}")
 
     if not silent:
         print(f"  sent: seq={seq} resp='{response}' to {addr[0]}")

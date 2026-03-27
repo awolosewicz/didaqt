@@ -298,7 +298,11 @@ static int parse_yaml(const char *path, didaqt_ctrl_ctx *ctx)
 
     yaml_parser_t parser;
     yaml_document_t doc;
-    yaml_parser_initialize(&parser);
+    if (!yaml_parser_initialize(&parser)) {
+        fprintf(stderr, "yaml_parser_initialize failed\n");
+        fclose(fp);
+        return DIDAQT_ERR;
+    }
     yaml_parser_set_input_file(&parser, fp);
 
     if (!yaml_parser_load(&parser, &doc)) {
@@ -429,6 +433,9 @@ static void dfs(didaqt_ctrl_ctx *ctx, int sender_idx,
             memcpy(p->hops, hops, num_hops * sizeof(path_hop));
             p->status = DIDAQT_PATH_AVAILABLE;
             ctx->num_paths++;
+        } else {
+            fprintf(stderr, "warning: max paths (%d) exceeded, "
+                    "some failover paths dropped\n", MAX_PATHS);
         }
     }
 
@@ -589,10 +596,10 @@ static ctrl_handler *find_handler(didaqt_ctrl_ctx *ctx, const char *tg)
  * Execute switch updates for transitioning from old_path to new_path.
  * Either may be NULL (pure tear-down or pure setup).
  */
-static void execute_failover(didaqt_ctrl_ctx *ctx,
-                             uint64_t sender_id,
-                             const ctrl_path *old_p,
-                             const ctrl_path *new_p)
+static int execute_failover(didaqt_ctrl_ctx *ctx,
+                            uint64_t sender_id,
+                            const ctrl_path *old_p,
+                            const ctrl_path *new_p)
 {
     /* Collect all switch nodes involved. */
     int sw_nodes[MAX_HOPS * 2];
@@ -650,10 +657,12 @@ static void execute_failover(didaqt_ctrl_ctx *ctx,
         const char *tg = sw->switch_type_group;
         ctrl_handler *h = find_handler(ctx, tg);
         if (h && h->fn) {
-            h->fn(sender_id, cur_in, cur_out, new_in, new_out,
-                  h->user_data);
+            int rc = h->fn(sender_id, cur_in, cur_out, new_in, new_out,
+                           h->user_data);
+            if (rc != 0) return rc;
         }
     }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -745,7 +754,15 @@ static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
 
     if (new_idx >= 0) {
         ctx->paths[new_idx].status = DIDAQT_PATH_USED;
-        execute_failover(ctx, sid, old, &ctx->paths[new_idx]);
+        if (execute_failover(ctx, sid, old, &ctx->paths[new_idx]) != 0) {
+            /* Switch update failed — rollback path state. */
+            old->status = DIDAQT_PATH_USED;
+            ctx->paths[new_idx].status = DIDAQT_PATH_AVAILABLE;
+            fprintf(stderr, "sender '%s' (id %lu): switch update failed, "
+                    "rollback\n",
+                    ctx->nodes[sender_idx].name, (unsigned long)sid);
+            return;
+        }
         mark_failover_time(ctx, sender_idx);
     } else {
         /* Still nothing — all paths are TempFailed, sender is dead. */
@@ -835,8 +852,35 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id)
     }
 
     /* ONE switch update using the representative's old/new paths. */
-    execute_failover(ctx, ctx->nodes[rep].sender_id,
-                     &ctx->paths[rep_old], &ctx->paths[rep_new]);
+    if (execute_failover(ctx, ctx->nodes[rep].sender_id,
+                         &ctx->paths[rep_old], &ctx->paths[rep_new]) != 0) {
+        /* Switch update failed — rollback ALL group members' path state. */
+        for (int s = 0; s < ctx->num_nodes; s++) {
+            if (!node_is_sender(&ctx->nodes[s])) continue;
+            if (ctx->nodes[s].group_id != group_id) continue;
+
+            /* Restore TempFailed back to Used. */
+            for (int i = 0; i < ctx->num_paths; i++) {
+                if (ctx->paths[i].sender_idx == s &&
+                    ctx->paths[i].status == DIDAQT_PATH_TEMP_FAILED) {
+                    ctx->paths[i].status = DIDAQT_PATH_USED;
+                    break;
+                }
+            }
+            /* Restore new Used back to Available. */
+            for (int i = 0; i < ctx->num_paths; i++) {
+                if (ctx->paths[i].sender_idx == s &&
+                    ctx->paths[i].receiver_idx == new_receiver &&
+                    ctx->paths[i].status == DIDAQT_PATH_USED) {
+                    ctx->paths[i].status = DIDAQT_PATH_AVAILABLE;
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "group %u: switch update failed, rollback\n",
+                group_id);
+        return;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -917,6 +961,18 @@ static int load_cache(didaqt_ctrl_ctx *ctx, const char *yaml_path)
     if (fread(ctx->paths, sizeof(ctrl_path), hdr.num_paths, fp)
         != (size_t)hdr.num_paths) goto fail;
     ctx->num_paths = hdr.num_paths;
+
+    /* Validate loaded path indices are within bounds. */
+    for (int i = 0; i < ctx->num_paths; i++) {
+        ctrl_path *p = &ctx->paths[i];
+        if (p->sender_idx < 0 || p->sender_idx >= ctx->num_nodes ||
+            p->receiver_idx < 0 || p->receiver_idx >= ctx->num_nodes)
+            goto fail;
+        for (int h = 0; h < p->num_hops; h++)
+            if (p->hops[h].node_idx < 0 ||
+                p->hops[h].node_idx >= ctx->num_nodes)
+                goto fail;
+    }
 
     fclose(fp);
     fprintf(stderr, "didaqt: loaded cache from %s (%d nodes, %d paths)\n",
@@ -1036,7 +1092,13 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
         didaqt_ctrl_revive_sender(ctx, (uint64_t)sids[si]);
         ctx->sender_seen[s] = 1;
 
-        /* Find and activate the path to this receiver. */
+        /* Clear any existing USED path for this sender, then activate
+         * the path to the receiver that reported it. */
+        for (int i = 0; i < ctx->num_paths; i++) {
+            if (ctx->paths[i].sender_idx == s &&
+                ctx->paths[i].status == DIDAQT_PATH_USED)
+                ctx->paths[i].status = DIDAQT_PATH_AVAILABLE;
+        }
         for (int i = 0; i < ctx->num_paths; i++) {
             if (ctx->paths[i].sender_idx == s &&
                 ctx->paths[i].receiver_idx == recv_idx) {
@@ -1092,6 +1154,7 @@ int didaqt_ctrl_get_path_statuses(const didaqt_ctrl_ctx *ctx,
     if (!ctx || !out || !count) return DIDAQT_ERR;
 
     *count = ctx->num_paths;
+    if (ctx->num_paths == 0) { *out = NULL; return DIDAQT_OK; }
     *out = calloc(ctx->num_paths, sizeof(didaqt_path_info));
     if (!*out) return DIDAQT_ERR;
 
@@ -1114,6 +1177,8 @@ int didaqt_ctrl_set_path_status(didaqt_ctrl_ctx *ctx,
                                 int path_id, didaqt_path_status status)
 {
     if (!ctx || path_id < 0 || path_id >= ctx->num_paths)
+        return DIDAQT_ERR;
+    if (status < DIDAQT_PATH_USED || status > DIDAQT_PATH_FAILED)
         return DIDAQT_ERR;
     ctx->paths[path_id].status = status;
     return DIDAQT_OK;

@@ -1,7 +1,7 @@
 /*
  * sender.c — Example DAQ data sender
  *
- * Sends a 10 Gbps stream of 1500-byte Ethernet frames over a raw
+ * Sends a continuous stream of 1500-byte Ethernet frames over a raw
  * AF_PACKET socket.  Each frame is Ethernet/802.1Q/IPv4/UDP with an
  * 8-byte magic value (SENDER_MAGIC) at the start of the UDP payload,
  * followed by padding to fill the frame.
@@ -66,9 +66,8 @@
 
 static volatile int running = 1;
 
-static void handle_signal(int sig)
+static void handle_signal(__attribute__((unused)) int sig)
 {
-    (void)sig;
     running = 0;
 }
 

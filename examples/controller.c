@@ -11,7 +11,8 @@
  * Usage:
  *   ./controller <topology.yaml> <heartbeat_port> [switch_ipv6]
  *
- * Requires: CAP_NET_RAW (run with sudo).
+ * Requires: CAP_NET_RAW for ICMPv6 switch communication (run with
+ * sudo); not needed in log-only mode (no switch_ipv6 argument).
  */
 
 #define _GNU_SOURCE
@@ -35,9 +36,8 @@
 
 static volatile int running = 1;
 
-static void handle_signal(int sig)
+static void handle_signal(__attribute__((unused)) int sig)
 {
-    (void)sig;
     running = 0;
 }
 
@@ -177,11 +177,18 @@ static int switch_conn_open(switch_conn *sc, const char *addr)
     struct icmp6_filter filt;
     ICMP6_FILTER_SETBLOCKALL(&filt);
     ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filt);
-    setsockopt(sc->sockfd, IPPROTO_ICMPV6, ICMP6_FILTER,
-               &filt, sizeof(filt));
+    if (setsockopt(sc->sockfd, IPPROTO_ICMPV6, ICMP6_FILTER,
+                   &filt, sizeof(filt)) < 0)
+        perror("setsockopt ICMP6_FILTER");
 
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-    setsockopt(sc->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (setsockopt(sc->sockfd, SOL_SOCKET, SO_RCVTIMEO,
+                   &tv, sizeof(tv)) < 0) {
+        perror("setsockopt SO_RCVTIMEO (ICMPv6)");
+        close(sc->sockfd);
+        sc->sockfd = -1;
+        return -1;
+    }
 
     return 0;
 }
@@ -196,7 +203,10 @@ static long switch_conn_send(switch_conn *sc, const char *cmd,
 
     size_t pkt_len = 8 + cmd_len;
     uint8_t pkt[8 + 256];
-    if (pkt_len > sizeof(pkt)) pkt_len = sizeof(pkt);
+    if (pkt_len > sizeof(pkt)) {
+        pkt_len = sizeof(pkt);
+        cmd_len = pkt_len - 8;
+    }
 
     memset(pkt, 0, 8);
     pkt[0] = ICMP6_ECHO_REQUEST;
@@ -357,7 +367,13 @@ int main(int argc, char **argv)
     g_ctx = ctx;
 
     /* ---- Register switch handler ---- */
-    didaqt_ctrl_register_handler(ctx, "tofino2", switch_handler, &sc);
+    if (didaqt_ctrl_register_handler(ctx, "tofino2",
+                                     switch_handler, &sc) != DIDAQT_OK) {
+        fprintf(stderr, "didaqt_ctrl_register_handler failed\n");
+        didaqt_ctrl_destroy(ctx);
+        switch_conn_close(&sc);
+        return 1;
+    }
 
     /* ---- Open heartbeat listener (IPv6 dual-stack) ---- */
     int sockfd = socket(AF_INET6, SOCK_DGRAM, 0);
@@ -393,7 +409,14 @@ int main(int argc, char **argv)
     /* Use a short receive timeout so the main loop can send periodic
      * keepalives to the switch agent between heartbeats. */
     struct timeval hb_tv = { .tv_sec = 0, .tv_usec = 100000 }; /* 100ms */
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &hb_tv, sizeof(hb_tv));
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
+                   &hb_tv, sizeof(hb_tv)) < 0) {
+        perror("setsockopt SO_RCVTIMEO (heartbeat)");
+        close(sockfd);
+        didaqt_ctrl_destroy(ctx);
+        switch_conn_close(&sc);
+        return 1;
+    }
 
     /* Clear screen and draw initial display. */
     printf("\033[2J");

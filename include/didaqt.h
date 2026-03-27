@@ -121,6 +121,11 @@ int didaqt_ctrl_register_handler(didaqt_ctrl_ctx *ctx,
 /*
  * didaqt_ctrl_process_heartbeat — Feed a received heartbeat packet
  * to the controller.  Triggers failover logic if senders are missing.
+ *
+ * After a failover, the affected sender's absence is ignored for a
+ * 1-second grace period to allow traffic to reach the new receiver.
+ * Senders must appear in at least one heartbeat before their absence
+ * can trigger a failover.
  */
 int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
                                   didaqt_ctrl_ctx *ctx);
@@ -145,6 +150,10 @@ int didaqt_ctrl_set_path_status(didaqt_ctrl_ctx *ctx,
  * dead and ignored by heartbeat processing.  This function clears
  * that flag and resets all FAILED/TEMP_FAILED paths for the sender
  * back to AVAILABLE so that failover can be attempted again.
+ *
+ * Also resets the sender's 'seen' flag, meaning the sender must
+ * appear in at least one heartbeat after revival before its absence
+ * can trigger a new failover.
  */
 int didaqt_ctrl_revive_sender(didaqt_ctrl_ctx *ctx, uint64_t sender_id);
 

@@ -53,9 +53,8 @@
 
 static volatile int running = 1;
 
-static void handle_signal(int sig)
+static void handle_signal(__attribute__((unused)) int sig)
 {
-    (void)sig;
     running = 0;
 }
 
@@ -110,8 +109,6 @@ static void update_statuses(void)
             s->status = STAT_OK;
         else
             s->status = STAT_MISSED;
-        /* If no new frames at all, status persists from previous. */
-        /* MISSED only applies when we had a refresh with zero new frames. */
 
         s->prev_valid   = s->valid;
         s->prev_invalid = s->invalid;
@@ -297,7 +294,10 @@ int main(int argc, char **argv)
         sender_stat *ss = get_sender(s_id);
 
         if (magic == SENDER_MAGIC) {
-            schedule_heartbeat(s_id, ctx);
+            int rc = schedule_heartbeat(s_id, ctx);
+            if (rc == DIDAQT_ERR_FULL)
+                fprintf(stderr, "receiver: sender %u: heartbeat schedule "
+                        "full, sender will not be tracked\n", s_id);
             if (ss) ss->valid++;
         } else {
             deschedule_heartbeat(s_id, ctx);
