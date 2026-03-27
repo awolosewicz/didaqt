@@ -12,9 +12,14 @@
 /*
  * Hash set for O(1) blocked/scheduled sender lookups.
  * Open-addressing with linear probing; capacity is always a power of 2.
- * Entry value 0 = empty (sender_id 0 is reserved/unused).
+ * Entry value 0 = empty (sender_id 0 is rejected at the API boundary).
  */
 #define HSET_CAP 512   /* must be power of 2, > DIDAQT_MAX_SENDERS */
+
+_Static_assert((HSET_CAP & (HSET_CAP - 1)) == 0,
+               "HSET_CAP must be a power of 2");
+_Static_assert(HSET_CAP / 2 >= DIDAQT_MAX_SENDERS,
+               "HSET_CAP/2 must be >= DIDAQT_MAX_SENDERS");
 
 typedef struct {
     uint32_t entries[HSET_CAP];
@@ -38,8 +43,26 @@ static int hset_contains(const sender_hset *s, uint32_t id)
     }
 }
 
+/* Internal insert — no load-factor check.  Used by hset_remove to
+ * re-insert displaced entries (total count cannot increase). */
+static void hset_reinsert(sender_hset *s, uint32_t id)
+{
+    uint32_t idx = id & (HSET_CAP - 1);
+    for (;;) {
+        uint32_t e = s->entries[idx];
+        if (e == 0) {
+            s->entries[idx] = id;
+            s->count++;
+            return;
+        }
+        if (e == id) return;  /* already present */
+        idx = (idx + 1) & (HSET_CAP - 1);
+    }
+}
+
 static int hset_insert(sender_hset *s, uint32_t id)
 {
+    if (id == 0) return -1;  /* 0 is the empty sentinel */
     if (s->count >= HSET_CAP / 2) return -1;  /* load factor limit */
     uint32_t idx = id & (HSET_CAP - 1);
     for (;;) {
@@ -56,12 +79,14 @@ static int hset_insert(sender_hset *s, uint32_t id)
 
 static void hset_remove(sender_hset *s, uint32_t id)
 {
+    if (id == 0) return;
     uint32_t idx = id & (HSET_CAP - 1);
     for (;;) {
         uint32_t e = s->entries[idx];
         if (e == 0) return;
         if (e == id) {
-            /* Remove and re-insert displaced entries. */
+            /* Remove and re-insert displaced entries using the
+             * internal reinsert (no load-factor check). */
             s->entries[idx] = 0;
             s->count--;
             uint32_t j = (idx + 1) & (HSET_CAP - 1);
@@ -69,7 +94,7 @@ static void hset_remove(sender_hset *s, uint32_t id)
                 uint32_t displaced = s->entries[j];
                 s->entries[j] = 0;
                 s->count--;
-                hset_insert(s, displaced);
+                hset_reinsert(s, displaced);
                 j = (j + 1) & (HSET_CAP - 1);
             }
             return;
@@ -78,7 +103,8 @@ static void hset_remove(sender_hset *s, uint32_t id)
     }
 }
 
-/* Collect all entries from the hash set into a flat array. */
+/* Collect all entries from the hash set into a flat array.
+ * Caller must provide a buffer of at least HSET_CAP/2 entries. */
 static int hset_to_array(const sender_hset *s, uint32_t *out)
 {
     int n = 0;
@@ -280,7 +306,7 @@ int didaqt_rx_start(didaqt_rx_ctx *ctx)
 
 int schedule_heartbeat(uint32_t s_id, didaqt_rx_ctx *ctx)
 {
-    if (!ctx)
+    if (!ctx || s_id == 0)
         return DIDAQT_ERR;
 
     pthread_mutex_lock(&ctx->lock);
@@ -298,13 +324,15 @@ int schedule_heartbeat(uint32_t s_id, didaqt_rx_ctx *ctx)
 
 int deschedule_heartbeat(uint32_t s_id, didaqt_rx_ctx *ctx)
 {
-    if (!ctx)
+    if (!ctx || s_id == 0)
         return DIDAQT_ERR;
 
     pthread_mutex_lock(&ctx->lock);
 
     hset_remove(&ctx->senders, s_id);
-    hset_insert(&ctx->blocked, s_id);
+    if (hset_insert(&ctx->blocked, s_id) < 0)
+        write(STDERR_FILENO,
+              "didaqt_rx: blocked set full\n", 28);
 
     pthread_mutex_unlock(&ctx->lock);
     return DIDAQT_OK;

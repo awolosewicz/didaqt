@@ -295,7 +295,7 @@ static int parse_connections(yaml_document_t *doc, yaml_node_t *node,
         if (bw) c->max_bandwidth = parse_bandwidth(bw);
 
         yaml_node_t *ic = map_get(doc, val, "initial_connections");
-        if (ic) parse_init_conns(doc, ic, c);
+        if (ic && parse_init_conns(doc, ic, c) < 0) return -1;
     }
     return 0;
 }
@@ -558,13 +558,17 @@ static void dfs(didaqt_ctrl_ctx *ctx, int sender_idx,
     /* If this node is a receiver endpoint, record the path. */
     if (node_is_receiver(n) && cur_node != sender_idx) {
         if (ensure_path_capacity(ctx) == 0) {
+            path_hop *h = NULL;
+            if (num_hops > 0) {
+                h = malloc(num_hops * sizeof(path_hop));
+                if (!h) return;
+                memcpy(h, hops, num_hops * sizeof(path_hop));
+            }
             ctrl_path *p = &ctx->paths[ctx->num_paths];
             p->sender_idx   = sender_idx;
             p->receiver_idx = cur_node;
             p->num_hops     = num_hops;
-            p->hops = malloc(num_hops * sizeof(path_hop));
-            if (p->hops)
-                memcpy(p->hops, hops, num_hops * sizeof(path_hop));
+            p->hops         = h;
             p->status = DIDAQT_PATH_AVAILABLE;
             ctx->num_paths++;
         }
@@ -592,14 +596,14 @@ static void dfs(didaqt_ctrl_ctx *ctx, int sender_idx,
     }
 }
 
-static void find_all_paths(didaqt_ctrl_ctx *ctx)
+static int find_all_paths(didaqt_ctrl_ctx *ctx)
 {
     int *visited = calloc(ctx->num_nodes, sizeof(int));
-    if (!visited) return;
+    if (!visited) return DIDAQT_ERR;
 
     /* DFS depth is bounded by the number of nodes (visited check). */
     path_hop *hops = malloc(ctx->num_nodes * sizeof(path_hop));
-    if (!hops) { free(visited); return; }
+    if (!hops) { free(visited); return DIDAQT_ERR; }
 
     for (int s = 0; s < ctx->num_nodes; s++) {
         if (!node_is_sender(&ctx->nodes[s])) continue;
@@ -620,18 +624,19 @@ static void find_all_paths(didaqt_ctrl_ctx *ctx)
 
     free(hops);
     free(visited);
+    return DIDAQT_OK;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Path ordering                                                      */
 /* ------------------------------------------------------------------ */
 
-static void compute_ordering(didaqt_ctrl_ctx *ctx)
+static int compute_ordering(didaqt_ctrl_ctx *ctx)
 {
     /* Compute contention per path using a seen-sender bitmap
      * to avoid O(P^3) deduplication. */
     int *seen = calloc(ctx->num_nodes, sizeof(int));
-    if (!seen) return;
+    if (!seen) return DIDAQT_ERR;
 
     for (int i = 0; i < ctx->num_paths; i++) {
         ctrl_path *p = &ctx->paths[i];
@@ -658,7 +663,7 @@ static void compute_ordering(didaqt_ctrl_ctx *ctx)
     /* Sort paths for each sender: contention asc, switch_updates asc.
      * Use a simple insertion sort grouped by sender. */
     int *idx = malloc(ctx->num_paths * sizeof(int));
-    if (!idx) return;
+    if (!idx) return DIDAQT_ERR;
 
     for (int s = 0; s < ctx->num_nodes; s++) {
         if (!node_is_sender(&ctx->nodes[s])) continue;
@@ -687,6 +692,7 @@ static void compute_ordering(didaqt_ctrl_ctx *ctx)
         }
     }
     free(idx);
+    return DIDAQT_OK;
 }
 
 /* Build per-sender path index after paths are sorted.
@@ -892,6 +898,16 @@ static int in_grace_period(const didaqt_ctrl_ctx *ctx, int sender_idx,
     return elapsed_ns < ctx->grace_period_ns;
 }
 
+/* Reset per-sender state after a successful failover. */
+static void reset_sender_after_failover(didaqt_ctrl_ctx *ctx,
+                                        int sender_idx,
+                                        const struct timespec *now)
+{
+    mark_failover_time(ctx, sender_idx, now);
+    ctx->runtime[sender_idx].seen_at_recv = 0;
+    ctx->runtime[sender_idx].miss_count = 0;
+}
+
 /* Recycle Failed paths back to Available for a sender.
  * TempFailed paths are NOT recycled — if every failover attempt
  * for a sender fails (all paths go TempFailed), the sender must
@@ -932,9 +948,7 @@ static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
                     ctx->nodes[sender_idx].name, (unsigned long)sid);
             return;
         }
-        mark_failover_time(ctx, sender_idx, now);
-        ctx->runtime[sender_idx].seen_at_recv = 0;
-        ctx->runtime[sender_idx].miss_count = 0;
+        reset_sender_after_failover(ctx, sender_idx, now);
     } else {
         /* Still nothing — all paths are TempFailed, sender is dead. */
         ctx->runtime[sender_idx].dead = 1;
@@ -1002,7 +1016,11 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id,
     if (ctx->num_paths > ctx->rollback_cap) {
         didaqt_path_status *tmp = realloc(ctx->rollback_buf,
                                           ctx->num_paths * sizeof(didaqt_path_status));
-        if (!tmp) return;
+        if (!tmp) {
+            fprintf(stderr, "group %u: rollback alloc failed, "
+                    "failover skipped\n", group_id);
+            return;
+        }
         ctx->rollback_buf = tmp;
         ctx->rollback_cap = ctx->num_paths;
     }
@@ -1034,9 +1052,7 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id,
             }
         }
 
-        mark_failover_time(ctx, s, now);
-        ctx->runtime[s].seen_at_recv = 0;
-        ctx->runtime[s].miss_count = 0;
+        reset_sender_after_failover(ctx, s, now);
     }
 
     /* ONE switch update using the representative's old/new paths. */
@@ -1087,8 +1103,11 @@ static int alloc_node_arrays(didaqt_ctrl_ctx *ctx)
     int n = ctx->num_nodes;
     ctx->runtime = calloc(n, sizeof(sender_runtime));
     ctx->handled_groups = calloc(n, sizeof(uint32_t));
-    if (!ctx->runtime || !ctx->handled_groups)
+    if (!ctx->runtime || !ctx->handled_groups) {
+        free(ctx->runtime);        ctx->runtime = NULL;
+        free(ctx->handled_groups);  ctx->handled_groups = NULL;
         return DIDAQT_ERR;
+    }
     return DIDAQT_OK;
 }
 
@@ -1111,8 +1130,11 @@ int didaqt_ctrl_process_topology(const char *yaml_path,
     rc = validate(ctx);
     if (rc != DIDAQT_OK) return rc;
 
-    find_all_paths(ctx);
-    compute_ordering(ctx);
+    rc = find_all_paths(ctx);
+    if (rc != DIDAQT_OK) return rc;
+
+    rc = compute_ordering(ctx);
+    if (rc != DIDAQT_OK) return rc;
 
     rc = build_sender_path_index(ctx);
     if (rc != DIDAQT_OK) return rc;
@@ -1171,9 +1193,8 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
         sids[i] = ntohl(sids[i]);
     }
 
-    /* Build a bitmap of sender IDs present in this heartbeat for O(1) lookup.
-     * sids[] values are uint32_t but we use sorted binary search for
-     * arbitrary IDs instead of a bitmap to avoid 512MB allocation. */
+    /* Linear scan over sids[] to check sender presence.
+     * Acceptable since scnt <= DIDAQT_MAX_SENDERS (256). */
 
     int recv_idx = id_lookup_find(ctx->recv_lookup, ctx->num_recv_lookup, rid);
     if (recv_idx < 0) return DIDAQT_ERR;
