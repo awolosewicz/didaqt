@@ -651,67 +651,116 @@ static int find_all_paths(didaqt_ctrl_ctx *ctx)
 /*  Path ordering                                                      */
 /* ------------------------------------------------------------------ */
 
+/* Compare paths by receiver_idx for qsort. */
+static int cmp_by_receiver(const void *a, const void *b)
+{
+    int ra = ((const ctrl_path *)a)->receiver_idx;
+    int rb = ((const ctrl_path *)b)->receiver_idx;
+    return (ra > rb) - (ra < rb);
+}
+
 static int compute_ordering(didaqt_ctrl_ctx *ctx)
 {
-    /* Compute contention per path using a seen-sender bitmap
-     * to avoid O(P^3) deduplication. */
-    int *seen = calloc(ctx->num_nodes, sizeof(int));
-    if (!seen) return DIDAQT_ERR;
+    int P = ctx->num_paths;
+    int N = ctx->num_nodes;
 
-    for (int i = 0; i < ctx->num_paths; i++) {
-        ctrl_path *p = &ctx->paths[i];
+    /* ---- Contention: O(P log P) via sort ----
+     * Sort paths by receiver, then count distinct senders per receiver
+     * in a single linear scan.  Contention = distinct_senders - 1. */
 
-        p->switch_updates = p->num_hops;
+    qsort(ctx->paths, P, sizeof(ctrl_path), cmp_by_receiver);
 
-        /* Count distinct OTHER senders that also reach this receiver. */
-        memset(seen, 0, ctx->num_nodes * sizeof(int));
-        int cont = 0;
-        for (int j = 0; j < ctx->num_paths; j++) {
-            if (j == i) continue;
-            if (ctx->paths[j].receiver_idx != p->receiver_idx) continue;
-            int si = ctx->paths[j].sender_idx;
-            if (si == p->sender_idx) continue;
-            if (!seen[si]) {
-                seen[si] = 1;
-                cont++;
-            }
+    /* recv_sender_count[node_idx] = distinct senders reaching that receiver. */
+    int *recv_sender_count = calloc(N, sizeof(int));
+    int *seen = calloc(N, sizeof(int));
+    if (!recv_sender_count || !seen) {
+        free(recv_sender_count); free(seen);
+        return DIDAQT_ERR;
+    }
+
+    /* Single O(P) scan over receiver-sorted paths. */
+    int run_start = 0;
+    while (run_start < P) {
+        int r = ctx->paths[run_start].receiver_idx;
+        int cnt = 0;
+        int i = run_start;
+        while (i < P && ctx->paths[i].receiver_idx == r) {
+            int si = ctx->paths[i].sender_idx;
+            if (!seen[si]) { seen[si] = 1; cnt++; }
+            i++;
         }
-        p->contention = cont;
+        recv_sender_count[r] = cnt;
+        /* Clear seen flags for senders in this run. */
+        for (int j = run_start; j < i; j++)
+            seen[ctx->paths[j].sender_idx] = 0;
+        run_start = i;
     }
     free(seen);
 
-    /* Sort paths for each sender: contention asc, switch_updates asc.
-     * Use a simple insertion sort grouped by sender. */
-    int *idx = malloc(ctx->num_paths * sizeof(int));
-    if (!idx) return DIDAQT_ERR;
+    for (int i = 0; i < P; i++) {
+        ctx->paths[i].switch_updates = ctx->paths[i].num_hops;
+        ctx->paths[i].contention =
+            recv_sender_count[ctx->paths[i].receiver_idx] - 1;
+    }
+    free(recv_sender_count);
 
-    for (int s = 0; s < ctx->num_nodes; s++) {
-        if (!node_is_sender(&ctx->nodes[s])) continue;
+    /* ---- Sort paths per sender: contention asc, switch_updates asc ----
+     * First sort ALL paths by sender_idx to group them, then insertion-sort
+     * within each group.  Avoids the O(S*P) gather scan. */
 
-        /* Gather indices of paths for this sender. */
-        int cnt = 0;
-        for (int i = 0; i < ctx->num_paths; i++)
-            if (ctx->paths[i].sender_idx == s)
-                idx[cnt++] = i;
+    /* Counting sort by sender_idx → O(P + N). */
+    int *count = calloc(N, sizeof(int));
+    if (!count) return DIDAQT_ERR;
+    for (int i = 0; i < P; i++)
+        count[ctx->paths[i].sender_idx]++;
 
-        /* Insertion sort on the gathered indices. */
+    int *offset = calloc(N, sizeof(int));
+    ctrl_path *tmp = malloc(P * sizeof(ctrl_path));
+    if (!offset || !tmp) {
+        free(count); free(offset); free(tmp);
+        return DIDAQT_ERR;
+    }
+    /* Prefix sum for sender offsets. */
+    offset[0] = 0;
+    for (int i = 1; i < N; i++)
+        offset[i] = offset[i - 1] + count[i - 1];
+
+    /* Distribute into tmp. */
+    int *pos = calloc(N, sizeof(int));
+    if (!pos) {
+        free(count); free(offset); free(tmp);
+        return DIDAQT_ERR;
+    }
+    for (int i = 0; i < P; i++) {
+        int s = ctx->paths[i].sender_idx;
+        tmp[offset[s] + pos[s]] = ctx->paths[i];
+        pos[s]++;
+    }
+    memcpy(ctx->paths, tmp, P * sizeof(ctrl_path));
+    free(tmp);
+    free(pos);
+
+    /* Insertion sort within each sender group. */
+    for (int s = 0; s < N; s++) {
+        if (count[s] <= 1) continue;
+        int base = offset[s];
+        int cnt  = count[s];
         for (int a = 1; a < cnt; a++) {
-            int ai = idx[a];
-            ctrl_path tmp = ctx->paths[ai];
+            ctrl_path key = ctx->paths[base + a];
             int b = a - 1;
             while (b >= 0) {
-                int bi = idx[b];
-                ctrl_path *bp = &ctx->paths[bi];
-                if (bp->contention < tmp.contention) break;
-                if (bp->contention == tmp.contention &&
-                    bp->switch_updates <= tmp.switch_updates) break;
-                ctx->paths[idx[b + 1]] = *bp;
+                ctrl_path *bp = &ctx->paths[base + b];
+                if (bp->contention < key.contention) break;
+                if (bp->contention == key.contention &&
+                    bp->switch_updates <= key.switch_updates) break;
+                ctx->paths[base + b + 1] = *bp;
                 b--;
             }
-            ctx->paths[idx[b + 1]] = tmp;
+            ctx->paths[base + b + 1] = key;
         }
     }
-    free(idx);
+    free(count);
+    free(offset);
     return DIDAQT_OK;
 }
 
