@@ -827,11 +827,12 @@ static void failover_sender(didaqt_ctrl_ctx *ctx, int sender_idx,
  */
 static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id)
 {
-    /* Find a representative sender and its current Used path. */
+    /* Find a representative sender (must be alive) and its current Used path. */
     int rep = -1, rep_old = -1;
     for (int s = 0; s < ctx->num_nodes && rep < 0; s++) {
         if (!node_is_sender(&ctx->nodes[s])) continue;
         if (ctx->nodes[s].group_id != group_id) continue;
+        if (ctx->sender_dead[s]) continue;
         for (int i = 0; i < ctx->num_paths; i++) {
             if (ctx->paths[i].sender_idx == s &&
                 ctx->paths[i].status == DIDAQT_PATH_USED) {
@@ -875,10 +876,11 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id)
     for (int i = 0; i < ctx->num_paths; i++)
         saved[i] = ctx->paths[i].status;
 
-    /* Move ALL senders in the group: Used→TempFailed, new path→Used. */
+    /* Move alive senders in the group: Used→TempFailed, new path→Used. */
     for (int s = 0; s < ctx->num_nodes; s++) {
         if (!node_is_sender(&ctx->nodes[s])) continue;
         if (ctx->nodes[s].group_id != group_id) continue;
+        if (ctx->sender_dead[s]) continue;
 
         /* TempFail the current Used path. */
         for (int i = 0; i < ctx->num_paths; i++) {
@@ -1084,13 +1086,25 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
 
             /* If this sender was never seen at its current receiver
              * since the last failover, the sender itself is dead —
-             * not the path.  Mark it dead individually without
-             * triggering a group failover. */
+             * not the path.  Mark it dead individually and revert
+             * the group to undo the unnecessary failover. */
             if (!ctx->sender_seen_at_recv[s]) {
                 ctx->sender_dead[s] = 1;
                 fprintf(stderr, "sender '%s' (id %lu): never seen at "
                         "current receiver, marked dead\n",
                         ctx->nodes[s].name, (unsigned long)sid);
+
+                if (gid != 0) {
+                    int already = 0;
+                    for (int g = 0; g < num_handled_groups; g++) {
+                        if (handled_groups[g] == gid) { already = 1; break; }
+                    }
+                    if (!already) {
+                        failover_group(ctx, gid);
+                        if (num_handled_groups < ctx->num_nodes)
+                            handled_groups[num_handled_groups++] = gid;
+                    }
+                }
                 continue;
             }
 
