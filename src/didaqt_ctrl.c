@@ -4,22 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <yaml.h>
 
-#define FAILOVER_GRACE_NS 1000000000L  /* 1 second grace period */
-
 /* ------------------------------------------------------------------ */
-/*  Internal limits                                                    */
+/*  Internal limits / initial sizes                                    */
 /* ------------------------------------------------------------------ */
 
-#define MAX_NODES         256
-#define MAX_PORTS          64
-#define MAX_INIT_CONN      32
-#define MAX_PATHS        4096
-#define MAX_HOPS           32
-#define MAX_HANDLERS       32
+#define INIT_PATHS     64
+#define INIT_HANDLERS   4
 #define NAME_LEN  DIDAQT_MAX_NAME
 
 /* ------------------------------------------------------------------ */
@@ -43,7 +36,7 @@ typedef struct {
     char      other_node[NAME_LEN];
     int       other_port;
     uint64_t  max_bandwidth;
-    init_conn init_conns[MAX_INIT_CONN];
+    init_conn *init_conns;
     int       num_init_conns;
 } connection;
 
@@ -64,7 +57,7 @@ typedef struct {
     /* switch attrs */
     char      switch_type_group[NAME_LEN];
 
-    connection conns[MAX_PORTS];
+    connection *conns;
     int        num_conns;
 } topo_node;
 
@@ -77,7 +70,7 @@ typedef struct {
 typedef struct {
     int                sender_idx;
     int                receiver_idx;
-    path_hop           hops[MAX_HOPS];
+    path_hop          *hops;
     int                num_hops;
     int                contention;
     int                switch_updates;
@@ -91,28 +84,24 @@ typedef struct {
 } ctrl_handler;
 
 struct didaqt_ctrl_ctx {
-    topo_node    nodes[MAX_NODES];
+    topo_node   *nodes;
     int          num_nodes;
 
-    ctrl_path    paths[MAX_PATHS];
+    ctrl_path   *paths;
     int          num_paths;
+    int          max_paths;      /* current allocation size */
 
-    /* Per-sender dead flag: indexed by node index.
-     * Set when all paths are exhausted; cleared by revive. */
-    int          sender_dead[MAX_NODES];
+    /* Post-failover grace period in nanoseconds. */
+    long         grace_period_ns;
 
-    /* Per-sender "seen" flag.  A sender must appear in at least one
-     * heartbeat before its absence can trigger failover.  This
-     * prevents false failovers during startup. */
-    int          sender_seen[MAX_NODES];
+    /* Per-node arrays (allocated to num_nodes after YAML parse). */
+    int              *sender_dead;
+    int              *sender_seen;
+    struct timespec  *last_failover;
 
-    /* Per-sender last-failover timestamp.  Missing-sender events are
-     * ignored for FAILOVER_GRACE_NS after a failover to allow traffic
-     * to reach the new receiver. */
-    struct timespec last_failover[MAX_NODES];
-
-    ctrl_handler handlers[MAX_HANDLERS];
-    int          num_handlers;
+    ctrl_handler *handlers;
+    int           num_handlers;
+    int           max_handlers;
 };
 
 /* ------------------------------------------------------------------ */
@@ -195,9 +184,16 @@ static int parse_init_conns(yaml_document_t *doc, yaml_node_t *node,
                             connection *conn)
 {
     if (!node || node->type != YAML_MAPPING_NODE) return 0;
+
+    int count = (int)(node->data.mapping.pairs.top
+                    - node->data.mapping.pairs.start);
+    if (count <= 0) return 0;
+
+    conn->init_conns = calloc(count, sizeof(init_conn));
+    if (!conn->init_conns) return -1;
+
     for (yaml_node_pair_t *p = node->data.mapping.pairs.start;
          p < node->data.mapping.pairs.top; p++) {
-        if (conn->num_init_conns >= MAX_INIT_CONN) break;
         yaml_node_t *val = yaml_document_get_node(doc, p->value);
         const char *s = map_str(doc, val, "sender");
         const char *r = map_str(doc, val, "receiver");
@@ -212,9 +208,16 @@ static int parse_connections(yaml_document_t *doc, yaml_node_t *node,
                              topo_node *tn)
 {
     if (!node || node->type != YAML_MAPPING_NODE) return 0;
+
+    int count = (int)(node->data.mapping.pairs.top
+                    - node->data.mapping.pairs.start);
+    if (count <= 0) return 0;
+
+    tn->conns = calloc(count, sizeof(connection));
+    if (!tn->conns) return -1;
+
     for (yaml_node_pair_t *p = node->data.mapping.pairs.start;
          p < node->data.mapping.pairs.top; p++) {
-        if (tn->num_conns >= MAX_PORTS) break;
         yaml_node_t *key = yaml_document_get_node(doc, p->key);
         yaml_node_t *val = yaml_document_get_node(doc, p->value);
         const char *port_s = scalar_val(doc, key);
@@ -242,7 +245,6 @@ static int parse_connections(yaml_document_t *doc, yaml_node_t *node,
 static int parse_node_entry(yaml_document_t *doc, yaml_node_t *entry,
                             topo_node *tn)
 {
-    memset(tn, 0, sizeof(*tn));
 
     const char *name = map_str(doc, entry, "name");
     if (name) strncpy(tn->name, name, NAME_LEN - 1);
@@ -321,12 +323,19 @@ static int parse_yaml(const char *path, didaqt_ctrl_ctx *ctx)
         return DIDAQT_ERR;
     }
 
+    /* Count nodes and allocate. */
+    int node_count = (int)(root->data.sequence.items.top
+                         - root->data.sequence.items.start);
+    ctx->nodes = calloc(node_count, sizeof(topo_node));
+    if (!ctx->nodes) {
+        yaml_document_delete(&doc);
+        yaml_parser_delete(&parser);
+        fclose(fp);
+        return DIDAQT_ERR;
+    }
+
     for (yaml_node_item_t *it = root->data.sequence.items.start;
          it < root->data.sequence.items.top; it++) {
-        if (ctx->num_nodes >= MAX_NODES) {
-            fprintf(stderr, "too many nodes (max %d)\n", MAX_NODES);
-            break;
-        }
         yaml_node_t *entry = yaml_document_get_node(&doc, *it);
         if (parse_node_entry(&doc, entry, &ctx->nodes[ctx->num_nodes]) == 0)
             ctx->num_nodes++;
@@ -417,25 +426,42 @@ static int validate(didaqt_ctrl_ctx *ctx)
 /*  Path finding (DFS)                                                 */
 /* ------------------------------------------------------------------ */
 
+/* Ensure the paths array has room for at least one more entry.
+ * Doubles the allocation when full. */
+static int ensure_path_capacity(didaqt_ctrl_ctx *ctx)
+{
+    if (ctx->num_paths < ctx->max_paths)
+        return 0;
+
+    int new_max = ctx->max_paths * 2;
+    if (new_max < INIT_PATHS) new_max = INIT_PATHS;
+    ctrl_path *tmp = realloc(ctx->paths, new_max * sizeof(ctrl_path));
+    if (!tmp) return -1;
+    memset(tmp + ctx->max_paths, 0,
+           (new_max - ctx->max_paths) * sizeof(ctrl_path));
+    ctx->paths     = tmp;
+    ctx->max_paths = new_max;
+    return 0;
+}
+
 static void dfs(didaqt_ctrl_ctx *ctx, int sender_idx,
                 int cur_node, int arrived_port,
-                int *visited, path_hop *hops, int num_hops)
+                int *visited, path_hop *hops, int max_hops, int num_hops)
 {
     topo_node *n = &ctx->nodes[cur_node];
 
     /* If this node is a receiver endpoint, record the path. */
     if (node_is_receiver(n) && cur_node != sender_idx) {
-        if (ctx->num_paths < MAX_PATHS) {
+        if (ensure_path_capacity(ctx) == 0) {
             ctrl_path *p = &ctx->paths[ctx->num_paths];
             p->sender_idx   = sender_idx;
             p->receiver_idx = cur_node;
             p->num_hops     = num_hops;
-            memcpy(p->hops, hops, num_hops * sizeof(path_hop));
+            p->hops = malloc(num_hops * sizeof(path_hop));
+            if (p->hops)
+                memcpy(p->hops, hops, num_hops * sizeof(path_hop));
             p->status = DIDAQT_PATH_AVAILABLE;
             ctx->num_paths++;
-        } else {
-            fprintf(stderr, "warning: max paths (%d) exceeded, "
-                    "some failover paths dropped\n", MAX_PATHS);
         }
     }
 
@@ -447,7 +473,7 @@ static void dfs(didaqt_ctrl_ctx *ctx, int sender_idx,
 
             int next = find_node(ctx, conn->other_node);
             if (next < 0 || visited[next]) continue;
-            if (num_hops >= MAX_HOPS) continue;
+            if (num_hops >= max_hops) continue;
 
             hops[num_hops].node_idx     = cur_node;
             hops[num_hops].ingress_port = arrived_port;
@@ -455,7 +481,7 @@ static void dfs(didaqt_ctrl_ctx *ctx, int sender_idx,
 
             visited[next] = 1;
             dfs(ctx, sender_idx, next, conn->other_port,
-                visited, hops, num_hops + 1);
+                visited, hops, max_hops, num_hops + 1);
             visited[next] = 0;
         }
     }
@@ -463,7 +489,12 @@ static void dfs(didaqt_ctrl_ctx *ctx, int sender_idx,
 
 static void find_all_paths(didaqt_ctrl_ctx *ctx)
 {
-    int visited[MAX_NODES];
+    int *visited = calloc(ctx->num_nodes, sizeof(int));
+    if (!visited) return;
+
+    /* DFS depth is bounded by the number of nodes (visited check). */
+    path_hop *hops = malloc(ctx->num_nodes * sizeof(path_hop));
+    if (!hops) { free(visited); return; }
 
     for (int s = 0; s < ctx->num_nodes; s++) {
         if (!node_is_sender(&ctx->nodes[s])) continue;
@@ -473,14 +504,17 @@ static void find_all_paths(didaqt_ctrl_ctx *ctx)
             int next = find_node(ctx, conn->other_node);
             if (next < 0) continue;
 
-            memset(visited, 0, sizeof(visited));
+            memset(visited, 0, ctx->num_nodes * sizeof(int));
             visited[s]    = 1;
             visited[next] = 1;
 
-            path_hop hops[MAX_HOPS];
-            dfs(ctx, s, next, conn->other_port, visited, hops, 0);
+            dfs(ctx, s, next, conn->other_port,
+                visited, hops, ctx->num_nodes, 0);
         }
     }
+
+    free(hops);
+    free(visited);
 }
 
 /* ------------------------------------------------------------------ */
@@ -523,7 +557,9 @@ static void compute_ordering(didaqt_ctrl_ctx *ctx)
         if (!node_is_sender(&ctx->nodes[s])) continue;
 
         /* Gather indices of paths for this sender. */
-        int idx[MAX_PATHS], cnt = 0;
+        int *idx = malloc(ctx->num_paths * sizeof(int));
+        if (!idx) return;
+        int cnt = 0;
         for (int i = 0; i < ctx->num_paths; i++)
             if (ctx->paths[i].sender_idx == s)
                 idx[cnt++] = i;
@@ -544,6 +580,7 @@ static void compute_ordering(didaqt_ctrl_ctx *ctx)
             }
             ctx->paths[idx[b + 1]] = tmp;
         }
+        free(idx);
     }
 }
 
@@ -602,7 +639,11 @@ static int execute_failover(didaqt_ctrl_ctx *ctx,
                             const ctrl_path *new_p)
 {
     /* Collect all switch nodes involved. */
-    int sw_nodes[MAX_HOPS * 2];
+    int max_sw = (old_p ? old_p->num_hops : 0)
+               + (new_p ? new_p->num_hops : 0);
+    if (max_sw == 0) return 0;
+    int *sw_nodes = malloc(max_sw * sizeof(int));
+    if (!sw_nodes) return -1;
     int sw_count = 0;
 
     if (old_p) {
@@ -659,9 +700,10 @@ static int execute_failover(didaqt_ctrl_ctx *ctx,
         if (h && h->fn) {
             int rc = h->fn(sender_id, cur_in, cur_out, new_in, new_out,
                            h->user_data);
-            if (rc != 0) return rc;
+            if (rc != 0) { free(sw_nodes); return rc; }
         }
     }
+    free(sw_nodes);
     return 0;
 }
 
@@ -721,7 +763,7 @@ static int in_grace_period(const didaqt_ctrl_ctx *ctx, int sender_idx)
     clock_gettime(CLOCK_MONOTONIC, &now);
     long elapsed_ns = (now.tv_sec  - ctx->last_failover[sender_idx].tv_sec) * 1000000000L
                     + (now.tv_nsec - ctx->last_failover[sender_idx].tv_nsec);
-    return elapsed_ns < FAILOVER_GRACE_NS;
+    return elapsed_ns < ctx->grace_period_ns;
 }
 
 /* Recycle Failed paths back to Available for a sender.
@@ -884,119 +926,6 @@ static void failover_group(didaqt_ctrl_ctx *ctx, uint32_t group_id)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Binary cache                                                       */
-/* ------------------------------------------------------------------ */
-
-#define CACHE_MAGIC  0x44514354U   /* "DQCT" */
-#define CACHE_VERSION 1
-
-typedef struct {
-    uint32_t magic;
-    uint32_t version;
-    int      num_nodes;
-    int      num_paths;
-} cache_header;
-
-/* Derive the cache path from the YAML path: replace extension with .dqcache */
-static void cache_path_from_yaml(const char *yaml_path,
-                                 char *out, size_t out_len)
-{
-    strncpy(out, yaml_path, out_len - 1);
-    out[out_len - 1] = '\0';
-    char *dot = strrchr(out, '.');
-    if (dot)
-        *dot = '\0';
-    size_t cur = strlen(out);
-    snprintf(out + cur, out_len - cur, ".dqcache");
-}
-
-static int save_cache(const didaqt_ctrl_ctx *ctx, const char *yaml_path)
-{
-    char cpath[1024];
-    cache_path_from_yaml(yaml_path, cpath, sizeof(cpath));
-
-    FILE *fp = fopen(cpath, "wb");
-    if (!fp) return DIDAQT_ERR;
-
-    cache_header hdr = {
-        .magic     = CACHE_MAGIC,
-        .version   = CACHE_VERSION,
-        .num_nodes = ctx->num_nodes,
-        .num_paths = ctx->num_paths,
-    };
-
-    if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1) goto fail;
-    if (fwrite(ctx->nodes, sizeof(topo_node), ctx->num_nodes, fp)
-        != (size_t)ctx->num_nodes) goto fail;
-    if (fwrite(ctx->paths, sizeof(ctrl_path), ctx->num_paths, fp)
-        != (size_t)ctx->num_paths) goto fail;
-
-    fclose(fp);
-    fprintf(stderr, "didaqt: saved cache to %s (%d nodes, %d paths)\n",
-            cpath, ctx->num_nodes, ctx->num_paths);
-    return DIDAQT_OK;
-
-fail:
-    fclose(fp);
-    return DIDAQT_ERR;
-}
-
-static int load_cache(didaqt_ctrl_ctx *ctx, const char *yaml_path)
-{
-    char cpath[1024];
-    cache_path_from_yaml(yaml_path, cpath, sizeof(cpath));
-
-    FILE *fp = fopen(cpath, "rb");
-    if (!fp) return DIDAQT_ERR;
-
-    cache_header hdr;
-    if (fread(&hdr, sizeof(hdr), 1, fp) != 1) goto fail;
-    if (hdr.magic != CACHE_MAGIC || hdr.version != CACHE_VERSION) goto fail;
-    if (hdr.num_nodes > MAX_NODES || hdr.num_paths > MAX_PATHS) goto fail;
-
-    if (fread(ctx->nodes, sizeof(topo_node), hdr.num_nodes, fp)
-        != (size_t)hdr.num_nodes) goto fail;
-    ctx->num_nodes = hdr.num_nodes;
-
-    if (fread(ctx->paths, sizeof(ctrl_path), hdr.num_paths, fp)
-        != (size_t)hdr.num_paths) goto fail;
-    ctx->num_paths = hdr.num_paths;
-
-    /* Validate loaded path indices are within bounds. */
-    for (int i = 0; i < ctx->num_paths; i++) {
-        ctrl_path *p = &ctx->paths[i];
-        if (p->sender_idx < 0 || p->sender_idx >= ctx->num_nodes ||
-            p->receiver_idx < 0 || p->receiver_idx >= ctx->num_nodes)
-            goto fail;
-        for (int h = 0; h < p->num_hops; h++)
-            if (p->hops[h].node_idx < 0 ||
-                p->hops[h].node_idx >= ctx->num_nodes)
-                goto fail;
-    }
-
-    fclose(fp);
-    fprintf(stderr, "didaqt: loaded cache from %s (%d nodes, %d paths)\n",
-            cpath, ctx->num_nodes, ctx->num_paths);
-    return DIDAQT_OK;
-
-fail:
-    fclose(fp);
-    return DIDAQT_ERR;
-}
-
-/* Check if the cache is newer than the YAML source. */
-static int cache_is_current(const char *yaml_path)
-{
-    char cpath[1024];
-    cache_path_from_yaml(yaml_path, cpath, sizeof(cpath));
-
-    struct stat yaml_st, cache_st;
-    if (stat(yaml_path, &yaml_st) != 0) return 0;
-    if (stat(cpath, &cache_st) != 0) return 0;
-    return cache_st.st_mtime >= yaml_st.st_mtime;
-}
-
-/* ------------------------------------------------------------------ */
 /*  Public API                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -1005,7 +934,29 @@ int didaqt_ctrl_init_ctx(didaqt_ctrl_ctx **ctx)
     if (!ctx) return DIDAQT_ERR;
     didaqt_ctrl_ctx *c = calloc(1, sizeof(*c));
     if (!c) return DIDAQT_ERR;
+
+    c->grace_period_ns = DIDAQT_DEFAULT_GRACE_PERIOD_NS;
+
     *ctx = c;
+    return DIDAQT_OK;
+}
+
+int didaqt_ctrl_set_grace_period(didaqt_ctrl_ctx *ctx, long grace_ns)
+{
+    if (!ctx || grace_ns < 0) return DIDAQT_ERR;
+    ctx->grace_period_ns = grace_ns;
+    return DIDAQT_OK;
+}
+
+/* Allocate per-node runtime arrays after YAML parse. */
+static int alloc_node_arrays(didaqt_ctrl_ctx *ctx)
+{
+    int n = ctx->num_nodes;
+    ctx->sender_dead   = calloc(n, sizeof(int));
+    ctx->sender_seen   = calloc(n, sizeof(int));
+    ctx->last_failover = calloc(n, sizeof(struct timespec));
+    if (!ctx->sender_dead || !ctx->sender_seen || !ctx->last_failover)
+        return DIDAQT_ERR;
     return DIDAQT_OK;
 }
 
@@ -1014,13 +965,10 @@ int didaqt_ctrl_process_topology(const char *yaml_path,
 {
     if (!ctx || !yaml_path) return DIDAQT_ERR;
 
-    /* Try loading from cache if it exists and is newer than the YAML. */
-    if (cache_is_current(yaml_path) &&
-        load_cache(ctx, yaml_path) == DIDAQT_OK)
-        return DIDAQT_OK;
-
-    /* Full processing: parse → validate → paths → order → init. */
     int rc = parse_yaml(yaml_path, ctx);
+    if (rc != DIDAQT_OK) return rc;
+
+    rc = alloc_node_arrays(ctx);
     if (rc != DIDAQT_OK) return rc;
 
     rc = validate(ctx);
@@ -1029,9 +977,6 @@ int didaqt_ctrl_process_topology(const char *yaml_path,
     find_all_paths(ctx);
     compute_ordering(ctx);
     setup_initial_state(ctx);
-
-    /* Save to cache for future runs. */
-    save_cache(ctx, yaml_path);
 
     return DIDAQT_OK;
 }
@@ -1042,7 +987,18 @@ int didaqt_ctrl_register_handler(didaqt_ctrl_ctx *ctx,
                                  void *user_data)
 {
     if (!ctx || !switch_type_group || !fn) return DIDAQT_ERR;
-    if (ctx->num_handlers >= MAX_HANDLERS) return DIDAQT_ERR_FULL;
+
+    /* Grow handlers array if needed. */
+    if (ctx->num_handlers >= ctx->max_handlers) {
+        int new_max = ctx->max_handlers ? ctx->max_handlers * 2 : INIT_HANDLERS;
+        ctrl_handler *tmp = realloc(ctx->handlers,
+                                    new_max * sizeof(ctrl_handler));
+        if (!tmp) return DIDAQT_ERR;
+        memset(tmp + ctx->max_handlers, 0,
+               (new_max - ctx->max_handlers) * sizeof(ctrl_handler));
+        ctx->handlers     = tmp;
+        ctx->max_handlers = new_max;
+    }
 
     ctrl_handler *h = &ctx->handlers[ctx->num_handlers++];
     strncpy(h->type_group, switch_type_group, NAME_LEN - 1);
@@ -1110,7 +1066,8 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
 
     /* Track which groups have already been failed over in this
      * heartbeat to avoid processing the same group multiple times. */
-    uint32_t handled_groups[MAX_NODES];
+    uint32_t *handled_groups = calloc(ctx->num_nodes, sizeof(uint32_t));
+    if (!handled_groups) return DIDAQT_ERR;
     int num_handled_groups = 0;
 
     /* For each sender with a Used path to this receiver: */
@@ -1136,7 +1093,7 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
                 }
                 if (!already) {
                     failover_group(ctx, gid);
-                    if (num_handled_groups < MAX_NODES)
+                    if (num_handled_groups < ctx->num_nodes)
                         handled_groups[num_handled_groups++] = gid;
                 }
             } else {
@@ -1145,6 +1102,7 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
         }
     }
 
+    free(handled_groups);
     return DIDAQT_OK;
 }
 
@@ -1213,7 +1171,32 @@ int didaqt_ctrl_revive_sender(didaqt_ctrl_ctx *ctx, uint64_t sender_id)
     return DIDAQT_OK;
 }
 
+static void free_nodes(topo_node *nodes, int num_nodes)
+{
+    if (!nodes) return;
+    for (int i = 0; i < num_nodes; i++) {
+        topo_node *n = &nodes[i];
+        if (n->conns) {
+            for (int c = 0; c < n->num_conns; c++)
+                free(n->conns[c].init_conns);
+            free(n->conns);
+        }
+    }
+    free(nodes);
+}
+
 void didaqt_ctrl_destroy(didaqt_ctrl_ctx *ctx)
 {
+    if (!ctx) return;
+    free_nodes(ctx->nodes, ctx->num_nodes);
+    if (ctx->paths) {
+        for (int i = 0; i < ctx->num_paths; i++)
+            free(ctx->paths[i].hops);
+        free(ctx->paths);
+    }
+    free(ctx->sender_dead);
+    free(ctx->sender_seen);
+    free(ctx->last_failover);
+    free(ctx->handlers);
     free(ctx);
 }

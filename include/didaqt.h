@@ -71,6 +71,9 @@ typedef enum {
 
 #define DIDAQT_MAX_NAME 64
 
+/* Default controller settings. */
+#define DIDAQT_DEFAULT_GRACE_PERIOD_NS 1000000000L  /* 1 second */
+
 /* Opaque controller context. */
 typedef struct didaqt_ctrl_ctx didaqt_ctrl_ctx;
 
@@ -100,6 +103,14 @@ typedef struct {
 int didaqt_ctrl_init_ctx(didaqt_ctrl_ctx **ctx);
 
 /*
+ * didaqt_ctrl_set_grace_period — Set the post-failover grace period
+ * in nanoseconds.  After a failover, the affected sender's absence
+ * from heartbeats is ignored for this duration.
+ * Default: DIDAQT_DEFAULT_GRACE_PERIOD_NS (1 second).
+ */
+int didaqt_ctrl_set_grace_period(didaqt_ctrl_ctx *ctx, long grace_ns);
+
+/*
  * didaqt_ctrl_process_topology — Parse a YAML topology file and
  * run static reachability analysis.
  *
@@ -123,7 +134,8 @@ int didaqt_ctrl_register_handler(didaqt_ctrl_ctx *ctx,
  * to the controller.  Triggers failover logic if senders are missing.
  *
  * After a failover, the affected sender's absence is ignored for a
- * 1-second grace period to allow traffic to reach the new receiver.
+ * configurable grace period (default 1s, see set_grace_period) to
+ * allow traffic to reach the new receiver.
  * Senders must appear in at least one heartbeat before their absence
  * can trigger a failover.
  */
