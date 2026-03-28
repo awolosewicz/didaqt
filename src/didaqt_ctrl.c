@@ -114,6 +114,13 @@ struct didaqt_ctrl_ctx {
     int         *sender_path_start;
     int         *sender_path_count;
 
+    /* Per-receiver path index: recv_path_idx[] stores path indices
+     * grouped by receiver.  recv_path_start/count index into it.
+     * Built once during preprocessing; O(senders_at_recv) lookup. */
+    int         *recv_path_idx;
+    int         *recv_path_start;
+    int         *recv_path_count;
+
     /* Post-failover grace period in nanoseconds. */
     long         grace_period_ns;
 
@@ -803,6 +810,49 @@ static int build_sender_path_index(didaqt_ctrl_ctx *ctx)
     return DIDAQT_OK;
 }
 
+/* Build a per-receiver path index: an indirect array of path indices
+ * grouped by receiver_idx, with start/count per receiver node.
+ * This allows process_heartbeat to iterate only over paths relevant
+ * to the heartbeat's receiver in O(paths_at_recv) instead of O(P). */
+static int build_recv_path_index(didaqt_ctrl_ctx *ctx)
+{
+    int P = ctx->num_paths;
+    int N = ctx->num_nodes;
+
+    ctx->recv_path_count = calloc(N, sizeof(int));
+    ctx->recv_path_start = calloc(N, sizeof(int));
+    ctx->recv_path_idx   = malloc(P * sizeof(int));
+    if (!ctx->recv_path_count || !ctx->recv_path_start || !ctx->recv_path_idx) {
+        free(ctx->recv_path_count); ctx->recv_path_count = NULL;
+        free(ctx->recv_path_start); ctx->recv_path_start = NULL;
+        free(ctx->recv_path_idx);   ctx->recv_path_idx   = NULL;
+        return DIDAQT_ERR;
+    }
+
+    /* Count paths per receiver. */
+    for (int i = 0; i < P; i++)
+        ctx->recv_path_count[ctx->paths[i].receiver_idx]++;
+
+    /* Prefix sum for start offsets. */
+    int offset = 0;
+    for (int r = 0; r < N; r++) {
+        ctx->recv_path_start[r] = offset;
+        offset += ctx->recv_path_count[r];
+    }
+
+    /* Fill the indirect index. */
+    int *pos = calloc(N, sizeof(int));
+    if (!pos) return DIDAQT_ERR;
+    for (int i = 0; i < P; i++) {
+        int r = ctx->paths[i].receiver_idx;
+        ctx->recv_path_idx[ctx->recv_path_start[r] + pos[r]] = i;
+        pos[r]++;
+    }
+    free(pos);
+
+    return DIDAQT_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Initial state                                                      */
 /* ------------------------------------------------------------------ */
@@ -1251,6 +1301,9 @@ int didaqt_ctrl_process_topology(const char *yaml_path,
     rc = build_sender_path_index(ctx);
     if (rc != DIDAQT_OK) return rc;
 
+    rc = build_recv_path_index(ctx);
+    if (rc != DIDAQT_OK) return rc;
+
     setup_initial_state(ctx);
 
     return DIDAQT_OK;
@@ -1343,10 +1396,13 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
     memset(ctx->handled_groups, 0, ctx->num_nodes * sizeof(uint32_t));
     int num_handled_groups = 0;
 
-    /* For each sender with a Used path to this receiver: */
-    for (int i = 0; i < ctx->num_paths; i++) {
+    /* For each sender with a Used path to this receiver.
+     * Uses the per-receiver path index for O(paths_at_recv) lookup. */
+    int rp_start = ctx->recv_path_start[recv_idx];
+    int rp_count = ctx->recv_path_count[recv_idx];
+    for (int ri = 0; ri < rp_count; ri++) {
+        int i = ctx->recv_path_idx[rp_start + ri];
         ctrl_path *p = &ctx->paths[i];
-        if (p->receiver_idx != recv_idx) continue;
         if (p->status != DIDAQT_PATH_USED) continue;
 
         int s = p->sender_idx;
@@ -1521,6 +1577,9 @@ void didaqt_ctrl_destroy(didaqt_ctrl_ctx *ctx)
     }
     free(ctx->sender_path_start);
     free(ctx->sender_path_count);
+    free(ctx->recv_path_idx);
+    free(ctx->recv_path_start);
+    free(ctx->recv_path_count);
     free(ctx->runtime);
     free(ctx->handled_groups);
     free(ctx->rollback_buf);

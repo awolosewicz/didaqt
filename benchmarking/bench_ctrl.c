@@ -77,7 +77,8 @@ static int build_hb(uint32_t rid, const uint32_t *sids, int cnt,
     return (int)need;
 }
 
-/* Per-receiver sender list for heartbeat construction. */
+/* Per-receiver sender list for heartbeat construction.
+ * Built once from path statuses; rebuilt only after failovers. */
 typedef struct {
     uint32_t receiver_id;
     uint32_t senders[MAX_SENDERS_PER_RECV];
@@ -87,13 +88,21 @@ typedef struct {
 static recv_bucket *buckets;
 static int          num_buckets;
 
-static void collect_used(didaqt_ctrl_ctx *ctx)
+/* rid_to_bucket[rid] = index into buckets[], -1 if none.
+ * Sized to max receiver_id + 1 for O(1) lookup. */
+static int *rid_to_bucket;
+static int  rid_to_bucket_sz;
+
+static void rebuild_map(didaqt_ctrl_ctx *ctx)
 {
     didaqt_path_info *paths;
     int path_count;
     didaqt_ctrl_get_path_statuses(ctx, &paths, &path_count);
 
+    /* Reset. */
     num_buckets = 0;
+    if (rid_to_bucket)
+        memset(rid_to_bucket, 0xff, rid_to_bucket_sz * sizeof(int));
 
     for (int i = 0; i < path_count; i++) {
         if (paths[i].status != DIDAQT_PATH_USED) continue;
@@ -101,15 +110,23 @@ static void collect_used(didaqt_ctrl_ctx *ctx)
         uint32_t rid = paths[i].receiver_id;
         uint32_t sid = (uint32_t)paths[i].sender_id;
 
-        /* Find or create bucket for this receiver. */
-        int b = -1;
-        for (int j = 0; j < num_buckets; j++) {
-            if (buckets[j].receiver_id == rid) { b = j; break; }
+        /* Grow lookup table if needed. */
+        if ((int)rid >= rid_to_bucket_sz) {
+            int new_sz = (int)rid + 1;
+            int *tmp = realloc(rid_to_bucket, new_sz * sizeof(int));
+            if (!tmp) continue;
+            memset(tmp + rid_to_bucket_sz, 0xff,
+                   (new_sz - rid_to_bucket_sz) * sizeof(int));
+            rid_to_bucket = tmp;
+            rid_to_bucket_sz = new_sz;
         }
+
+        int b = rid_to_bucket[rid];
         if (b < 0) {
             b = num_buckets++;
             buckets[b].receiver_id = rid;
             buckets[b].count = 0;
+            rid_to_bucket[rid] = b;
         }
         if (buckets[b].count < MAX_SENDERS_PER_RECV)
             buckets[b].senders[buckets[b].count++] = sid;
@@ -121,7 +138,7 @@ static void collect_used(didaqt_ctrl_ctx *ctx)
 /* Send heartbeats from all receivers with their current USED senders. */
 static void send_all_heartbeats(didaqt_ctrl_ctx *ctx)
 {
-    collect_used(ctx);
+    rebuild_map(ctx);
 
     uint8_t buf[6 + MAX_SENDERS_PER_RECV * 4];
     for (int i = 0; i < num_buckets; i++) {
@@ -133,44 +150,34 @@ static void send_all_heartbeats(didaqt_ctrl_ctx *ctx)
     }
 }
 
-/* Find the receiver_id for a given sender (by USED path). */
-static uint32_t find_sender_recv(didaqt_ctrl_ctx *ctx, uint32_t sid)
+/* Find the receiver_id for a given sender (by USED path in current map). */
+static uint32_t find_sender_recv(uint32_t sid)
 {
-    didaqt_path_info *paths;
-    int count;
-    didaqt_ctrl_get_path_statuses(ctx, &paths, &count);
-
-    uint32_t rid = 0;
-    for (int i = 0; i < count; i++) {
-        if (paths[i].status == DIDAQT_PATH_USED &&
-            (uint32_t)paths[i].sender_id == sid) {
-            rid = paths[i].receiver_id;
-            break;
+    for (int i = 0; i < num_buckets; i++) {
+        for (int j = 0; j < buckets[i].count; j++) {
+            if (buckets[i].senders[j] == sid)
+                return buckets[i].receiver_id;
         }
     }
-    free(paths);
-    return rid;
+    return 0;
 }
 
-/* Build heartbeat for a receiver, optionally excluding one sender. */
-static int build_hb_without(didaqt_ctrl_ctx *ctx, uint32_t rid,
-                              uint32_t exclude_sid,
+/* Build heartbeat for a receiver, excluding one sender.
+ * Uses the current map — no re-query. */
+static int build_hb_without(uint32_t rid, uint32_t exclude_sid,
                               uint8_t *buf, size_t sz)
 {
-    collect_used(ctx);
+    if ((int)rid >= rid_to_bucket_sz) return -1;
+    int b = rid_to_bucket[rid];
+    if (b < 0) return -1;
 
-    for (int i = 0; i < num_buckets; i++) {
-        if (buckets[i].receiver_id != rid) continue;
-
-        uint32_t filtered[MAX_SENDERS_PER_RECV];
-        int cnt = 0;
-        for (int j = 0; j < buckets[i].count; j++) {
-            if (buckets[i].senders[j] != exclude_sid)
-                filtered[cnt++] = buckets[i].senders[j];
-        }
-        return build_hb(rid, filtered, cnt, buf, sz);
+    uint32_t filtered[MAX_SENDERS_PER_RECV];
+    int cnt = 0;
+    for (int j = 0; j < buckets[b].count; j++) {
+        if (buckets[b].senders[j] != exclude_sid)
+            filtered[cnt++] = buckets[b].senders[j];
     }
-    return -1;
+    return build_hb(rid, filtered, cnt, buf, sz);
 }
 
 /* ------------------------------------------------------------------ */
@@ -255,7 +262,8 @@ int main(int argc, char **argv)
     long decisions[NUM_TRIALS];
 
     for (int t = 0; t < NUM_TRIALS; t++) {
-        uint32_t rid = find_sender_recv(ctx, target_sid);
+        /* Map is current from the previous send_all_heartbeats. */
+        uint32_t rid = find_sender_recv(target_sid);
         if (rid == 0) {
             fprintf(stderr, "trial %d: sender %u has no USED path\n",
                     t, target_sid);
@@ -265,7 +273,7 @@ int main(int argc, char **argv)
 
         /* Build heartbeat from rid WITHOUT target sender. */
         uint8_t buf[6 + MAX_SENDERS_PER_RECV * 4];
-        int len = build_hb_without(ctx, rid, target_sid, buf, sizeof(buf));
+        int len = build_hb_without(rid, target_sid, buf, sizeof(buf));
         if (len < 0) {
             fprintf(stderr, "trial %d: build_hb_without failed\n", t);
             decisions[t] = -1;
