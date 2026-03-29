@@ -250,6 +250,8 @@ static int id_lookup_find(const id_lookup *tbl, int count, uint64_t id)
     return -1;
 }
 
+static void free_nodes(topo_node *nodes, int num_nodes);
+
 /* ------------------------------------------------------------------ */
 /*  YAML streaming parser (event-based)                                */
 /* ------------------------------------------------------------------ */
