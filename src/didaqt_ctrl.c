@@ -133,10 +133,6 @@ struct didaqt_ctrl_ctx {
     /* Pre-allocated scratch for handled_groups in process_heartbeat. */
     uint32_t    *handled_groups;
 
-    /* Pre-allocated rollback buffer for group failover. */
-    didaqt_path_status *rollback_buf;
-    int                 rollback_cap;
-
     /* Group member index: flat array of sender node indices grouped by
      * group_id.  Eliminates O(N) scans in failover_group. */
     int         *group_members;     /* sender node indices */
@@ -669,54 +665,8 @@ static int ensure_path_capacity(didaqt_ctrl_ctx *ctx)
     return 0;
 }
 
-static void dfs(didaqt_ctrl_ctx *ctx, int sender_idx,
-                int cur_node, int arrived_port,
-                int *visited, path_hop *hops, int max_hops, int num_hops)
-{
-    topo_node *n = &ctx->nodes[cur_node];
-
-    /* If this node is a receiver endpoint, record the path. */
-    if (node_is_receiver(n) && cur_node != sender_idx) {
-        if (ensure_path_capacity(ctx) == 0) {
-            path_hop *h = NULL;
-            if (num_hops > 0) {
-                h = malloc(num_hops * sizeof(path_hop));
-                if (!h) return;
-                memcpy(h, hops, num_hops * sizeof(path_hop));
-            }
-            ctrl_path *p = &ctx->paths[ctx->num_paths];
-            p->sender_idx   = sender_idx;
-            p->receiver_idx = cur_node;
-            p->num_hops     = num_hops;
-            p->hops         = h;
-            p->status = DIDAQT_PATH_AVAILABLE;
-            ctx->num_paths++;
-        }
-    }
-
-    /* If this node can forward traffic, continue the search. */
-    if (node_forwards(n)) {
-        for (int c = 0; c < n->num_conns; c++) {
-            connection *conn = &n->conns[c];
-            if (conn->port_num == arrived_port) continue;
-
-            int next = conn->other_node_idx;
-            if (next < 0 || visited[next]) continue;
-            if (num_hops >= max_hops) continue;
-
-            hops[num_hops].node_idx     = cur_node;
-            hops[num_hops].ingress_port = arrived_port;
-            hops[num_hops].egress_port  = conn->port_num;
-
-            visited[next] = 1;
-            dfs(ctx, sender_idx, next, conn->other_port,
-                visited, hops, max_hops, num_hops + 1);
-            visited[next] = 0;
-        }
-    }
-}
-
-/* Generation-counter variant: visited[node] == gen means visited. */
+/* DFS with generation counter: visited[node] == gen means visited.
+ * Avoids O(N) memset per sender in find_all_paths. */
 static void dfs_gen(didaqt_ctrl_ctx *ctx, int sender_idx,
                     int cur_node, int arrived_port,
                     int *visited, int gen,
@@ -1884,7 +1834,6 @@ void didaqt_ctrl_destroy(didaqt_ctrl_ctx *ctx)
     free(ctx->sender_recv_count);
     free(ctx->runtime);
     free(ctx->handled_groups);
-    free(ctx->rollback_buf);
     free(ctx->sender_lookup);
     free(ctx->recv_lookup);
     free(ctx->handlers);
