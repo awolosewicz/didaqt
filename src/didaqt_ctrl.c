@@ -436,13 +436,58 @@ static int parse_yaml(const char *path, didaqt_ctrl_ctx *ctx)
 /*  Post-parse: resolve names to indices, build lookup tables          */
 /* ------------------------------------------------------------------ */
 
+/* Sorted name→index table for O(log N) lookups during resolve. */
+typedef struct { const char *name; int idx; } name_entry;
+
+static int cmp_name_entry(const void *a, const void *b)
+{
+    return strcmp(((const name_entry *)a)->name,
+                  ((const name_entry *)b)->name);
+}
+
+static int find_node_sorted(const name_entry *tbl, int n, const char *name)
+{
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int c = strcmp(tbl[mid].name, name);
+        if (c == 0) return tbl[mid].idx;
+        if (c < 0) lo = mid + 1;
+        else        hi = mid - 1;
+    }
+    return -1;
+}
+
 static void resolve_node_indices(didaqt_ctrl_ctx *ctx)
 {
-    for (int i = 0; i < ctx->num_nodes; i++) {
+    int N = ctx->num_nodes;
+
+    /* Build sorted name table: O(N log N). */
+    name_entry *tbl = malloc(N * sizeof(name_entry));
+    if (!tbl) {
+        /* Fallback to linear scan. */
+        for (int i = 0; i < N; i++) {
+            topo_node *n = &ctx->nodes[i];
+            for (int c = 0; c < n->num_conns; c++)
+                n->conns[c].other_node_idx =
+                    find_node(ctx, n->conns[c].other_node);
+        }
+        return;
+    }
+    for (int i = 0; i < N; i++) {
+        tbl[i].name = ctx->nodes[i].name;
+        tbl[i].idx  = i;
+    }
+    qsort(tbl, N, sizeof(name_entry), cmp_name_entry);
+
+    /* Resolve: O(C log N). */
+    for (int i = 0; i < N; i++) {
         topo_node *n = &ctx->nodes[i];
         for (int c = 0; c < n->num_conns; c++)
-            n->conns[c].other_node_idx = find_node(ctx, n->conns[c].other_node);
+            n->conns[c].other_node_idx =
+                find_node_sorted(tbl, N, n->conns[c].other_node);
     }
+    free(tbl);
 }
 
 static int build_lookup_tables(didaqt_ctrl_ctx *ctx)
@@ -658,50 +703,67 @@ static int find_all_paths(didaqt_ctrl_ctx *ctx)
 /*  Path ordering                                                      */
 /* ------------------------------------------------------------------ */
 
-/* Compare paths by receiver_idx for qsort. */
-static int cmp_by_receiver(const void *a, const void *b)
-{
-    int ra = ((const ctrl_path *)a)->receiver_idx;
-    int rb = ((const ctrl_path *)b)->receiver_idx;
-    return (ra > rb) - (ra < rb);
-}
-
 static int compute_ordering(didaqt_ctrl_ctx *ctx)
 {
     int P = ctx->num_paths;
     int N = ctx->num_nodes;
 
-    /* ---- Contention: O(P log P) via sort ----
-     * Sort paths by receiver, then count distinct senders per receiver
-     * in a single linear scan.  Contention = distinct_senders - 1. */
+    /* ---- Contention: O(P + N) ----
+     * Group paths by receiver via counting sort on indices (not structs).
+     * Then count distinct senders per receiver group. */
 
-    qsort(ctx->paths, P, sizeof(ctrl_path), cmp_by_receiver);
-
-    /* recv_sender_count[node_idx] = distinct senders reaching that receiver. */
+    int *recv_count  = calloc(N, sizeof(int));
+    int *recv_offset = calloc(N, sizeof(int));
+    int *recv_idx    = malloc(P * sizeof(int));  /* path indices by receiver */
+    int *seen        = calloc(N, sizeof(int));
     int *recv_sender_count = calloc(N, sizeof(int));
-    int *seen = calloc(N, sizeof(int));
-    if (!recv_sender_count || !seen) {
-        free(recv_sender_count); free(seen);
+    if (!recv_count || !recv_offset || !recv_idx || !seen ||
+        !recv_sender_count) {
+        free(recv_count); free(recv_offset); free(recv_idx);
+        free(seen); free(recv_sender_count);
         return DIDAQT_ERR;
     }
 
-    /* Single O(P) scan over receiver-sorted paths. */
-    int run_start = 0;
-    while (run_start < P) {
-        int r = ctx->paths[run_start].receiver_idx;
+    for (int i = 0; i < P; i++)
+        recv_count[ctx->paths[i].receiver_idx]++;
+
+    int off = 0;
+    for (int r = 0; r < N; r++) {
+        recv_offset[r] = off;
+        off += recv_count[r];
+    }
+
+    /* Distribute path indices into receiver groups. */
+    int *rpos = calloc(N, sizeof(int));
+    if (!rpos) {
+        free(recv_count); free(recv_offset); free(recv_idx);
+        free(seen); free(recv_sender_count);
+        return DIDAQT_ERR;
+    }
+    for (int i = 0; i < P; i++) {
+        int r = ctx->paths[i].receiver_idx;
+        recv_idx[recv_offset[r] + rpos[r]] = i;
+        rpos[r]++;
+    }
+    free(rpos);
+
+    /* Count distinct senders per receiver. */
+    for (int r = 0; r < N; r++) {
+        if (recv_count[r] == 0) continue;
+        int base = recv_offset[r];
         int cnt = 0;
-        int i = run_start;
-        while (i < P && ctx->paths[i].receiver_idx == r) {
-            int si = ctx->paths[i].sender_idx;
+        for (int j = 0; j < recv_count[r]; j++) {
+            int si = ctx->paths[recv_idx[base + j]].sender_idx;
             if (!seen[si]) { seen[si] = 1; cnt++; }
-            i++;
         }
         recv_sender_count[r] = cnt;
-        /* Clear seen flags for senders in this run. */
-        for (int j = run_start; j < i; j++)
-            seen[ctx->paths[j].sender_idx] = 0;
-        run_start = i;
+        /* Clear seen flags. */
+        for (int j = 0; j < recv_count[r]; j++)
+            seen[ctx->paths[recv_idx[base + j]].sender_idx] = 0;
     }
+    free(recv_idx);
+    free(recv_count);
+    free(recv_offset);
     free(seen);
 
     for (int i = 0; i < P; i++) {
