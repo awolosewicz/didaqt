@@ -87,37 +87,14 @@ def gen_topology(target_senders, switch_count):
                     lines.append(f"      max_bandwidth: 100G")
                     next_port += 1
 
-            # --- Inputs from previous stage (stage > 0) ---
+            # No backward connections for non-first stages.
+            # The DFS enters via arrived_port (which it skips), so
+            # no connection definition is needed on the input ports.
+            # This prevents the DFS from zigzagging backwards through
+            # the butterfly, which would cause path explosion.
             if not is_first:
-                prev_stage = stage - 1
-                mask = 1 << prev_stage   # butterfly mask for prev→this transition
-
-                # Straight input: from prev stage, same column
-                straight_src = i
-                prev_sw = f"SW{prev_stage}_{straight_src + 1}"
-                # The prev switch's straight output port
-                if prev_stage == 0:
-                    prev_out_port = 25  # stage 0: ports 25,26 are outputs
-                else:
-                    prev_out_port = 3   # intermediate: ports 3,4 are outputs
-                lines.append(f"    {next_port}:")
-                lines.append(f"      other_node: {prev_sw}")
-                lines.append(f"      other_port: {prev_out_port}")
-                lines.append(f"      max_bandwidth: 600G")
-                next_port += 1
-
-                # Cross input: from prev stage, column i XOR mask
-                cross_src = i ^ mask
-                prev_sw_cross = f"SW{prev_stage}_{cross_src + 1}"
-                if prev_stage == 0:
-                    prev_cross_port = 26
-                else:
-                    prev_cross_port = 4
-                lines.append(f"    {next_port}:")
-                lines.append(f"      other_node: {prev_sw_cross}")
-                lines.append(f"      other_port: {prev_cross_port}")
-                lines.append(f"      max_bandwidth: 600G")
-                next_port += 1
+                # Reserve port numbers for the inputs (used as arrived_port)
+                next_port = 3  # ports 1,2 are inputs (straight, cross)
 
             # --- Outputs ---
             if is_first and is_last:
