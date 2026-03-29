@@ -279,14 +279,14 @@ int main(int argc, char **argv)
     }
 
     /* ---- Output results ---- */
-    /* num_buckets = distinct receivers, set by send_all_heartbeats. */
-    int n_receivers = num_buckets;
+    /* num_buckets = distinct receivers with USED paths = active receivers. */
+    int active_recv = num_buckets;
 
-    fprintf(stderr, "paths=%d switches_per_path=%d preprocess=%.3fms\n",
-            n_receivers, switch_count, preprocess_ns / 1e6);
+    fprintf(stderr, "active_receivers=%d switches_per_path=%d preprocess=%.3fms\n",
+            active_recv, switch_count, preprocess_ns / 1e6);
 
-    /* Line 1: n_receivers, switch_count, preprocess_ns */
-    printf("%d,%d,%ld\n", n_receivers, switch_count, preprocess_ns);
+    /* Line 1: active_receivers, switch_count, preprocess_ns */
+    printf("%d,%d,%ld\n", active_recv, switch_count, preprocess_ns);
 
     /* Lines 2-11: decision_ns per trial (skip failed trials) */
     for (int t = 0; t < NUM_TRIALS; t++) {

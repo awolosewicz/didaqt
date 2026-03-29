@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Generate a DiDAQt benchmark topology YAML.
 
-Usage: gen_topology.py <target_senders> <switch_count> [output_file]
+Usage: gen_topology.py <target_active_receivers> <switch_count> [output_file]
 
 Generates a butterfly-style topology where:
-  - Path number = number of senders
-  - Receivers = senders / 2 (4 senders per receiver, 2x redundancy)
-  - M = senders / 24 switch columns, identical at every stage
+  - Target parameter = number of active receivers (with initial USED paths)
+  - Senders = active_receivers * 4 (4 senders per receiver at 25G each)
+  - Total receivers = active_receivers * 2 (2x redundancy)
+  - M = active_receivers / 6 switch columns (6 active receivers per column)
   - Stage 0: 24 sender inputs + 2 outputs (straight + cross)
   - Intermediate stages: 2 inputs + 2 outputs (straight + cross)
-  - Last stage: 2 inputs + 12 receiver outputs
+  - Last stage: 2 inputs + 12 receiver outputs (6 active + 6 backup)
   - Cross pattern: stage s→s+1, switch i cross-connects to i XOR 2^s
 
 Paths per sender = 2^(switch_count-1) * 12.
@@ -24,15 +25,16 @@ def round_up(n, m):
     return ((n + m - 1) // m) * m
 
 
-def gen_topology(target_senders, switch_count):
-    # M must be a multiple of 2^(switch_count-1) for the butterfly XOR
-    # masks.  Use multiple of 4 so the same M works for sc=1,2,3.
-    M = round_up(math.ceil(target_senders / 24), 4)
+def gen_topology(target_active_recv, switch_count):
+    # Each switch column has 6 active receivers out of 12 total.
+    # M must be a multiple of 4 for the butterfly XOR masks.
+    M = round_up(math.ceil(target_active_recv / 6), 4)
     if M < 4:
         M = 4
 
     n_senders = M * 24
-    n_receivers = M * 12
+    n_receivers = M * 12  # total (active + backup)
+    n_active_recv = M * 6
     num_stages = switch_count
 
     lines = []
@@ -171,8 +173,8 @@ def gen_topology(target_senders, switch_count):
     header = [
         f"# Butterfly topology: {n_senders} senders, "
         f"{M * num_stages} switches ({num_stages} stages x {M} columns), "
-        f"{n_receivers} receivers",
-        f"# Target senders: {target_senders}, rounded: {n_senders}",
+        f"{n_receivers} receivers ({n_active_recv} active + {n_active_recv} backup)",
+        f"# Target active receivers: {target_active_recv}, rounded: {n_active_recv}",
         f"# Paths per sender: {paths_per_sender}",
         f"# Total DFS paths: {total_paths}",
         "",
@@ -183,14 +185,14 @@ def gen_topology(target_senders, switch_count):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <target_senders> <switch_count> [output_file]",
-              file=sys.stderr)
+        print(f"Usage: {sys.argv[0]} <target_active_receivers> <switch_count> "
+              f"[output_file]", file=sys.stderr)
         sys.exit(1)
 
     target = int(sys.argv[1])
     sc = int(sys.argv[2])
     if target < 1:
-        print("error: target_senders must be >= 1", file=sys.stderr)
+        print("error: target_active_receivers must be >= 1", file=sys.stderr)
         sys.exit(1)
     if sc < 1:
         print("error: switch_count must be >= 1", file=sys.stderr)
