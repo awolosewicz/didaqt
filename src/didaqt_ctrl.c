@@ -275,17 +275,20 @@ static void free_nodes(topo_node *nodes, int num_nodes);
  *             receiver: ...
  */
 
-/* Parser depth levels. */
+/* Parser states.  *_KEY states expect a scalar key; *_VAL states expect
+ * the value (scalar or MAPPING_START) for the key stored in pc.key. */
 enum {
-    PD_TOP,          /* inside the root sequence */
-    PD_NODE,         /* inside a node mapping */
-    PD_NODE_KEY,     /* expecting a node-level key */
-    PD_CONNS,        /* inside 'connections' mapping */
-    PD_CONN,         /* inside a single connection mapping */
-    PD_CONN_KEY,     /* expecting a connection-level key */
-    PD_INITCONNS,    /* inside 'initial_connections' mapping */
-    PD_INITCONN,     /* inside a single init_conn mapping */
-    PD_INITCONN_KEY, /* expecting an init_conn-level key */
+    PD_TOP,             /* inside the root sequence, expecting MAPPING_START */
+    PD_NODE_KEY,        /* expecting a node-level key */
+    PD_NODE_VAL,        /* expecting a scalar value for a node key */
+    PD_CONNS_KEY,       /* inside 'connections', expecting port-number key */
+    PD_CONN_VAL,        /* saw port key, expecting MAPPING_START for connection */
+    PD_CONN_KEY,        /* inside a connection, expecting field key */
+    PD_CONN_FIELD_VAL,  /* expecting scalar value for a connection field */
+    PD_IC_KEY,          /* inside 'initial_connections', expecting entry key */
+    PD_IC_VAL,          /* saw entry key, expecting MAPPING_START for init_conn */
+    PD_IC_FIELD_KEY,    /* inside init_conn, expecting field key */
+    PD_IC_FIELD_VAL,    /* expecting scalar value for init_conn field */
 };
 
 typedef struct {
@@ -421,8 +424,7 @@ static int parse_yaml(const char *path, didaqt_ctrl_ctx *ctx)
     pc.state = PD_TOP;
     int err = 0;
     int done = 0;
-    int map_depth = 0;    /* nesting depth for skipping unknown mappings */
-    int skip_depth = 0;   /* > 0 means we're skipping an unknown subtree */
+    int skip_depth = 0;
 
     while (!done && !err) {
         yaml_event_t ev;
@@ -450,20 +452,22 @@ static int parse_yaml(const char *path, didaqt_ctrl_ctx *ctx)
             break;
 
         case YAML_SEQUENCE_START_EVENT:
-            /* Root sequence — nothing to do. */
+        case YAML_SEQUENCE_END_EVENT:
             break;
 
         case YAML_MAPPING_START_EVENT:
-            map_depth++;
             if (pc.state == PD_TOP) {
-                /* Start of a new node entry. */
+                /* New node entry in root sequence. */
                 if (ensure_node_cap(&pc) < 0) { err = 1; break; }
                 pc.cur_node = &pc.nodes[pc.num_nodes];
                 memset(pc.cur_node, 0, sizeof(topo_node));
                 pc.conn_alloc = 0;
                 pc.state = PD_NODE_KEY;
-            } else if (pc.state == PD_CONNS) {
-                /* Start of a connection (port number was the key). */
+            } else if (pc.state == PD_NODE_VAL) {
+                /* Value for "connections" key → enter connections mapping. */
+                pc.state = PD_CONNS_KEY;
+            } else if (pc.state == PD_CONN_VAL) {
+                /* Value for a port key → start connection entry. */
                 if (ensure_conn_cap(&pc) < 0) { err = 1; break; }
                 connection *c = &pc.cur_node->conns[pc.cur_node->num_conns];
                 memset(c, 0, sizeof(*c));
@@ -472,88 +476,100 @@ static int parse_yaml(const char *path, didaqt_ctrl_ctx *ctx)
                 pc.cur_conn = c;
                 pc.ic_alloc = 0;
                 pc.state = PD_CONN_KEY;
-            } else if (pc.state == PD_INITCONNS) {
-                /* Start of an init_conn entry. */
+            } else if (pc.state == PD_CONN_FIELD_VAL) {
+                /* Value for "initial_connections" → enter ic mapping. */
+                pc.state = PD_IC_KEY;
+            } else if (pc.state == PD_IC_VAL) {
+                /* Value for an ic entry key → start init_conn. */
                 if (ensure_ic_cap(&pc) < 0) { err = 1; break; }
                 pc.cur_ic = &pc.cur_conn->init_conns[pc.cur_conn->num_init_conns];
                 memset(pc.cur_ic, 0, sizeof(*pc.cur_ic));
-                pc.state = PD_INITCONN_KEY;
+                pc.state = PD_IC_FIELD_KEY;
             } else {
-                /* Unknown nested mapping — skip it. */
                 skip_depth = 1;
             }
             break;
 
         case YAML_MAPPING_END_EVENT:
-            map_depth--;
             if (pc.state == PD_NODE_KEY) {
-                /* End of a node entry. */
                 pc.num_nodes++;
                 pc.cur_node = NULL;
                 pc.state = PD_TOP;
+            } else if (pc.state == PD_CONNS_KEY) {
+                pc.state = PD_NODE_KEY;
             } else if (pc.state == PD_CONN_KEY) {
-                /* End of a connection entry. */
                 pc.cur_node->num_conns++;
                 pc.cur_conn = NULL;
-                pc.state = PD_CONNS;
-            } else if (pc.state == PD_CONNS) {
-                /* End of the 'connections' mapping. */
-                pc.state = PD_NODE_KEY;
-            } else if (pc.state == PD_INITCONN_KEY) {
-                /* End of an init_conn entry. */
+                pc.state = PD_CONNS_KEY;
+            } else if (pc.state == PD_IC_KEY) {
+                pc.state = PD_CONN_KEY;
+            } else if (pc.state == PD_IC_FIELD_KEY) {
                 pc.cur_conn->num_init_conns++;
                 pc.cur_ic = NULL;
-                pc.state = PD_INITCONNS;
-            } else if (pc.state == PD_INITCONNS) {
-                /* End of 'initial_connections' mapping. */
-                pc.state = PD_CONN_KEY;
+                pc.state = PD_IC_KEY;
             }
             break;
 
         case YAML_SCALAR_EVENT: {
             const char *val = (const char *)ev.data.scalar.value;
 
-            if (pc.state == PD_NODE_KEY) {
-                /* This scalar is a key in the node mapping. */
+            switch (pc.state) {
+            case PD_NODE_KEY:
+                /* Key in node mapping. */
                 strncpy(pc.key, val, NAME_LEN - 1);
                 pc.key[NAME_LEN - 1] = '\0';
-                if (strcmp(val, "connections") == 0)
-                    pc.state = PD_CONNS;
-                else
-                    pc.state = PD_NODE;
-            } else if (pc.state == PD_NODE) {
-                /* Value for a node-level key. */
-                apply_node_field(&pc, val);
-                pc.state = PD_NODE_KEY;
-            } else if (pc.state == PD_CONNS) {
-                /* Key inside connections = port number. */
+                pc.state = PD_NODE_VAL;
+                break;
+            case PD_NODE_VAL:
+                /* Scalar value for node key. */
+                if (strcmp(pc.key, "connections") != 0) {
+                    apply_node_field(&pc, val);
+                    pc.state = PD_NODE_KEY;
+                }
+                /* If key was "connections" but value is scalar (unexpected),
+                 * just go back to key state. */
+                else pc.state = PD_NODE_KEY;
+                break;
+            case PD_CONNS_KEY:
+                /* Port-number key inside connections. */
                 strncpy(pc.key, val, NAME_LEN - 1);
                 pc.key[NAME_LEN - 1] = '\0';
-            } else if (pc.state == PD_CONN_KEY) {
-                /* Key inside a connection. */
+                pc.state = PD_CONN_VAL;
+                break;
+            case PD_CONN_KEY:
+                /* Field key inside a connection. */
                 strncpy(pc.key, val, NAME_LEN - 1);
                 pc.key[NAME_LEN - 1] = '\0';
-                if (strcmp(val, "initial_connections") == 0)
-                    pc.state = PD_INITCONNS;
-                else
-                    pc.state = PD_CONN;
-            } else if (pc.state == PD_CONN) {
-                /* Value for a connection-level key. */
-                apply_conn_field(&pc, val);
-                pc.state = PD_CONN_KEY;
-            } else if (pc.state == PD_INITCONNS) {
-                /* Key inside initial_connections = entry number. */
+                pc.state = PD_CONN_FIELD_VAL;
+                break;
+            case PD_CONN_FIELD_VAL:
+                /* Scalar value for connection field. */
+                if (strcmp(pc.key, "initial_connections") != 0) {
+                    apply_conn_field(&pc, val);
+                    pc.state = PD_CONN_KEY;
+                } else {
+                    pc.state = PD_CONN_KEY;
+                }
+                break;
+            case PD_IC_KEY:
+                /* Entry key inside initial_connections. */
                 strncpy(pc.key, val, NAME_LEN - 1);
                 pc.key[NAME_LEN - 1] = '\0';
-            } else if (pc.state == PD_INITCONN_KEY) {
-                /* Key inside an init_conn. */
+                pc.state = PD_IC_VAL;
+                break;
+            case PD_IC_FIELD_KEY:
+                /* Field key inside an init_conn. */
                 strncpy(pc.key, val, NAME_LEN - 1);
                 pc.key[NAME_LEN - 1] = '\0';
-                pc.state = PD_INITCONN;
-            } else if (pc.state == PD_INITCONN) {
-                /* Value for an init_conn field. */
+                pc.state = PD_IC_FIELD_VAL;
+                break;
+            case PD_IC_FIELD_VAL:
+                /* Scalar value for init_conn field. */
                 apply_ic_field(&pc, val);
-                pc.state = PD_INITCONN_KEY;
+                pc.state = PD_IC_FIELD_KEY;
+                break;
+            default:
+                break;
             }
             break;
         }
