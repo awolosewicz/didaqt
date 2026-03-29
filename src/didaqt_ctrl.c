@@ -528,42 +528,76 @@ static int build_lookup_tables(didaqt_ctrl_ctx *ctx)
 /*  Validation                                                         */
 /* ------------------------------------------------------------------ */
 
+/* qsort helpers for validate. */
+static int cmp_uint64(const void *a, const void *b)
+{
+    uint64_t va = *(const uint64_t *)a;
+    uint64_t vb = *(const uint64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+typedef struct { uint32_t gid; int node_idx; } group_entry;
+
+static int cmp_group_entry(const void *a, const void *b)
+{
+    uint32_t ga = ((const group_entry *)a)->gid;
+    uint32_t gb = ((const group_entry *)b)->gid;
+    return (ga > gb) - (ga < gb);
+}
+
 static int validate(didaqt_ctrl_ctx *ctx)
 {
     int err = 0;
 
-    /* Unique sender_ids. */
-    for (int i = 0; i < ctx->num_nodes; i++) {
-        if (!node_is_sender(&ctx->nodes[i])) continue;
-        for (int j = i + 1; j < ctx->num_nodes; j++) {
-            if (!node_is_sender(&ctx->nodes[j])) continue;
-            if (ctx->nodes[i].sender_id == ctx->nodes[j].sender_id) {
-                fprintf(stderr, "duplicate sender_id %lu: '%s' and '%s'\n",
-                        (unsigned long)ctx->nodes[i].sender_id,
-                        ctx->nodes[i].name, ctx->nodes[j].name);
+    /* Unique sender_ids — sort and scan for duplicates: O(S log S). */
+    int ns = 0;
+    for (int i = 0; i < ctx->num_nodes; i++)
+        if (node_is_sender(&ctx->nodes[i])) ns++;
+
+    uint64_t *sids = malloc(ns * sizeof(uint64_t));
+    if (sids) {
+        int k = 0;
+        for (int i = 0; i < ctx->num_nodes; i++)
+            if (node_is_sender(&ctx->nodes[i]))
+                sids[k++] = ctx->nodes[i].sender_id;
+        qsort(sids, ns, sizeof(uint64_t), cmp_uint64);
+        for (int i = 1; i < ns; i++) {
+            if (sids[i] == sids[i - 1]) {
+                fprintf(stderr, "duplicate sender_id %lu\n",
+                        (unsigned long)sids[i]);
                 err = 1;
             }
         }
+        free(sids);
     }
 
-    /* Group constraint: same group_id ⇒ same initial_receiver. */
-    for (int i = 0; i < ctx->num_nodes; i++) {
-        if (!node_is_sender(&ctx->nodes[i])) continue;
-        if (ctx->nodes[i].group_id == 0) continue;
-        for (int j = i + 1; j < ctx->num_nodes; j++) {
-            if (!node_is_sender(&ctx->nodes[j])) continue;
-            if (ctx->nodes[i].group_id != ctx->nodes[j].group_id) continue;
-            if (strcmp(ctx->nodes[i].initial_receiver,
-                       ctx->nodes[j].initial_receiver) != 0) {
+    /* Group constraint — sort by group_id, check within each run: O(S log S). */
+    group_entry *grps = malloc(ns * sizeof(group_entry));
+    if (grps) {
+        int k = 0;
+        for (int i = 0; i < ctx->num_nodes; i++) {
+            if (!node_is_sender(&ctx->nodes[i])) continue;
+            if (ctx->nodes[i].group_id == 0) continue;
+            grps[k].gid = ctx->nodes[i].group_id;
+            grps[k].node_idx = i;
+            k++;
+        }
+        qsort(grps, k, sizeof(group_entry), cmp_group_entry);
+        for (int i = 1; i < k; i++) {
+            if (grps[i].gid != grps[i - 1].gid) continue;
+            int a = grps[i - 1].node_idx, b = grps[i].node_idx;
+            if (strcmp(ctx->nodes[a].initial_receiver,
+                       ctx->nodes[b].initial_receiver) != 0) {
                 fprintf(stderr,
                         "group %u: '%s' initial_receiver='%s' != "
                         "'%s' initial_receiver='%s'\n",
-                        ctx->nodes[i].group_id,
-                        ctx->nodes[i].name, ctx->nodes[i].initial_receiver,
-                        ctx->nodes[j].name, ctx->nodes[j].initial_receiver);
+                        ctx->nodes[a].group_id,
+                        ctx->nodes[a].name, ctx->nodes[a].initial_receiver,
+                        ctx->nodes[b].name, ctx->nodes[b].initial_receiver);
                 err = 1;
             }
         }
+        free(grps);
     }
 
     /* Bandwidth symmetry (uses resolved indices). */
@@ -668,14 +702,65 @@ static void dfs(didaqt_ctrl_ctx *ctx, int sender_idx,
     }
 }
 
+/* Generation-counter variant: visited[node] == gen means visited. */
+static void dfs_gen(didaqt_ctrl_ctx *ctx, int sender_idx,
+                    int cur_node, int arrived_port,
+                    int *visited, int gen,
+                    path_hop *hops, int max_hops, int num_hops)
+{
+    topo_node *n = &ctx->nodes[cur_node];
+
+    if (node_is_receiver(n) && cur_node != sender_idx) {
+        if (ensure_path_capacity(ctx) == 0) {
+            path_hop *h = NULL;
+            if (num_hops > 0) {
+                h = malloc(num_hops * sizeof(path_hop));
+                if (!h) return;
+                memcpy(h, hops, num_hops * sizeof(path_hop));
+            }
+            ctrl_path *p = &ctx->paths[ctx->num_paths];
+            p->sender_idx   = sender_idx;
+            p->receiver_idx = cur_node;
+            p->num_hops     = num_hops;
+            p->hops         = h;
+            p->status = DIDAQT_PATH_AVAILABLE;
+            ctx->num_paths++;
+        }
+    }
+
+    if (node_forwards(n)) {
+        for (int c = 0; c < n->num_conns; c++) {
+            connection *conn = &n->conns[c];
+            if (conn->port_num == arrived_port) continue;
+
+            int next = conn->other_node_idx;
+            if (next < 0 || visited[next] == gen) continue;
+            if (num_hops >= max_hops) continue;
+
+            hops[num_hops].node_idx     = cur_node;
+            hops[num_hops].ingress_port = arrived_port;
+            hops[num_hops].egress_port  = conn->port_num;
+
+            visited[next] = gen;
+            dfs_gen(ctx, sender_idx, next, conn->other_port,
+                    visited, gen, hops, max_hops, num_hops + 1);
+            visited[next] = 0;
+        }
+    }
+}
+
 static int find_all_paths(didaqt_ctrl_ctx *ctx)
 {
+    /* Use a generation counter instead of memset to clear the visited
+     * array.  Each DFS run increments the generation; a node is visited
+     * if visited[node] == gen.  This avoids O(N) memset per sender. */
     int *visited = calloc(ctx->num_nodes, sizeof(int));
     if (!visited) return DIDAQT_ERR;
 
-    /* DFS depth is bounded by the number of nodes (visited check). */
     path_hop *hops = malloc(ctx->num_nodes * sizeof(path_hop));
     if (!hops) { free(visited); return DIDAQT_ERR; }
+
+    int gen = 0;
 
     for (int s = 0; s < ctx->num_nodes; s++) {
         if (!node_is_sender(&ctx->nodes[s])) continue;
@@ -685,12 +770,12 @@ static int find_all_paths(didaqt_ctrl_ctx *ctx)
             int next = conn->other_node_idx;
             if (next < 0) continue;
 
-            memset(visited, 0, ctx->num_nodes * sizeof(int));
-            visited[s]    = 1;
-            visited[next] = 1;
+            gen++;
+            visited[s]    = gen;
+            visited[next] = gen;
 
-            dfs(ctx, s, next, conn->other_port,
-                visited, hops, ctx->num_nodes, 0);
+            dfs_gen(ctx, s, next, conn->other_port,
+                    visited, gen, hops, ctx->num_nodes, 0);
         }
     }
 
@@ -926,10 +1011,22 @@ static int build_recv_path_index(didaqt_ctrl_ctx *ctx)
  */
 static void setup_initial_state(didaqt_ctrl_ctx *ctx)
 {
-    for (int s = 0; s < ctx->num_nodes; s++) {
+    /* Build sorted name table for O(log N) lookups. */
+    int N = ctx->num_nodes;
+    name_entry *tbl = malloc(N * sizeof(name_entry));
+    if (tbl) {
+        for (int i = 0; i < N; i++) {
+            tbl[i].name = ctx->nodes[i].name;
+            tbl[i].idx  = i;
+        }
+        qsort(tbl, N, sizeof(name_entry), cmp_name_entry);
+    }
+
+    for (int s = 0; s < N; s++) {
         if (!node_is_sender(&ctx->nodes[s])) continue;
 
-        int target = find_node(ctx, ctx->nodes[s].initial_receiver);
+        int target = tbl ? find_node_sorted(tbl, N, ctx->nodes[s].initial_receiver)
+                         : find_node(ctx, ctx->nodes[s].initial_receiver);
         if (target < 0) {
             fprintf(stderr, "'%s': initial_receiver '%s' not found\n",
                     ctx->nodes[s].name, ctx->nodes[s].initial_receiver);
@@ -945,6 +1042,7 @@ static void setup_initial_state(didaqt_ctrl_ctx *ctx)
             }
         }
     }
+    free(tbl);
 }
 
 /* ------------------------------------------------------------------ */
