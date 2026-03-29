@@ -109,10 +109,12 @@ typedef enum {
 
 typedef struct {
     didaqt_event_type type;
-    uint64_t sender_id;
+    uint64_t sender_id;   /* 0 for group-level DEAD events */
     uint32_t group_id;
-    long     elapsed_ns;  /* FAILOVER: decision time before switch update;
-                             CONFIRMED: time since switch update completed */
+    long     elapsed_ns;  /* FAILOVER:  decision time before switch update
+                             CONFIRMED: time since switch update completed
+                             DEAD:      0
+                             REVIVED:   0 */
 } didaqt_event;
 
 typedef void (*didaqt_event_fn)(const didaqt_event *event, void *user_data);

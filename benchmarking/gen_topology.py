@@ -189,6 +189,12 @@ if __name__ == "__main__":
 
     target = int(sys.argv[1])
     sc = int(sys.argv[2])
+    if target < 1:
+        print("error: target_senders must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    if sc < 1:
+        print("error: switch_count must be >= 1", file=sys.stderr)
+        sys.exit(1)
     yaml_text = gen_topology(target, sc)
 
     if len(sys.argv) >= 4:

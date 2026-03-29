@@ -114,7 +114,11 @@ static void rebuild_map(didaqt_ctrl_ctx *ctx)
         if ((int)rid >= rid_to_bucket_sz) {
             int new_sz = (int)rid + 1;
             int *tmp = realloc(rid_to_bucket, new_sz * sizeof(int));
-            if (!tmp) continue;
+            if (!tmp) {
+                fprintf(stderr, "rebuild_map: realloc failed\n");
+                free(paths);
+                return;
+            }
             memset(tmp + rid_to_bucket_sz, 0xff,
                    (new_sz - rid_to_bucket_sz) * sizeof(int));
             rid_to_bucket = tmp;
@@ -123,6 +127,7 @@ static void rebuild_map(didaqt_ctrl_ctx *ctx)
 
         int b = rid_to_bucket[rid];
         if (b < 0) {
+            if (num_buckets >= MAX_RECEIVERS) continue;
             b = num_buckets++;
             buckets[b].receiver_id = rid;
             buckets[b].count = 0;
@@ -228,30 +233,14 @@ int main(int argc, char **argv)
     long preprocess_ns = (t1.tv_sec - t0.tv_sec) * 1000000000L
                         + (t1.tv_nsec - t0.tv_nsec);
 
-    /* Count actual paths. */
-    didaqt_path_info *all_paths;
-    int total_paths;
-    didaqt_ctrl_get_path_statuses(ctx, &all_paths, &total_paths);
-
-    /* Count receivers (from path info). */
-    int rounded_paths = 0;
-    {
-        uint32_t seen_recv[MAX_RECEIVERS];
-        int n_seen = 0;
-        for (int i = 0; i < total_paths; i++) {
-            uint32_t r = all_paths[i].receiver_id;
-            int found = 0;
-            for (int j = 0; j < n_seen; j++)
-                if (seen_recv[j] == r) { found = 1; break; }
-            if (!found && n_seen < MAX_RECEIVERS)
-                seen_recv[n_seen++] = r;
-        }
-        rounded_paths = n_seen;
-    }
-    free(all_paths);
-
     /* Register mock handler. */
-    didaqt_ctrl_register_handler(ctx, "tofino2", mock_handler, NULL);
+    if (didaqt_ctrl_register_handler(ctx, "tofino2", mock_handler, NULL)
+        != DIDAQT_OK) {
+        fprintf(stderr, "register_handler failed\n");
+        didaqt_ctrl_destroy(ctx);
+        free(buckets);
+        return 1;
+    }
 
     /* ---- Mark all senders as "seen" ---- */
     send_all_heartbeats(ctx);
@@ -290,17 +279,25 @@ int main(int argc, char **argv)
     }
 
     /* ---- Output results ---- */
+    /* num_buckets = distinct receivers, set by send_all_heartbeats. */
+    int n_receivers = num_buckets;
+
     fprintf(stderr, "paths=%d switches_per_path=%d preprocess=%.3fms\n",
-            rounded_paths, switch_count, preprocess_ns / 1e6);
+            n_receivers, switch_count, preprocess_ns / 1e6);
 
-    /* Line 1: rounded_paths, switch_count, preprocess_ns */
-    printf("%d,%d,%ld\n", rounded_paths, switch_count, preprocess_ns);
+    /* Line 1: n_receivers, switch_count, preprocess_ns */
+    printf("%d,%d,%ld\n", n_receivers, switch_count, preprocess_ns);
 
-    /* Lines 2-11: decision_ns per trial */
-    for (int t = 0; t < NUM_TRIALS; t++)
-        printf("%ld\n", decisions[t]);
+    /* Lines 2-11: decision_ns per trial (skip failed trials) */
+    for (int t = 0; t < NUM_TRIALS; t++) {
+        if (decisions[t] < 0)
+            printf("FAIL\n");
+        else
+            printf("%ld\n", decisions[t]);
+    }
 
     didaqt_ctrl_destroy(ctx);
     free(buckets);
+    free(rid_to_bucket);
     return 0;
 }
