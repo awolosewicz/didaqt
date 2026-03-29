@@ -251,152 +251,154 @@ static int id_lookup_find(const id_lookup *tbl, int count, uint64_t id)
 }
 
 /* ------------------------------------------------------------------ */
-/*  YAML helpers (document API)                                        */
+/*  YAML streaming parser (event-based)                                */
 /* ------------------------------------------------------------------ */
 
-static const char *scalar_val(__attribute__((unused)) yaml_document_t *doc,
-                              yaml_node_t *n)
+/*
+ * State machine for parsing topology YAML via libyaml events.
+ * This avoids loading the entire document into memory (the DOM API
+ * requires multi-GB for large topologies).
+ *
+ * Expected structure:
+ *   - name: ...           # sequence of node mappings
+ *     type: sender|receiver|switch|sender-receiver
+ *     connections:
+ *       <port>:
+ *         other_node: ...
+ *         other_port: ...
+ *         max_bandwidth: ...
+ *         initial_connections:
+ *           <id>:
+ *             sender: ...
+ *             receiver: ...
+ */
+
+/* Parser depth levels. */
+enum {
+    PD_TOP,          /* inside the root sequence */
+    PD_NODE,         /* inside a node mapping */
+    PD_NODE_KEY,     /* expecting a node-level key */
+    PD_CONNS,        /* inside 'connections' mapping */
+    PD_CONN,         /* inside a single connection mapping */
+    PD_CONN_KEY,     /* expecting a connection-level key */
+    PD_INITCONNS,    /* inside 'initial_connections' mapping */
+    PD_INITCONN,     /* inside a single init_conn mapping */
+    PD_INITCONN_KEY, /* expecting an init_conn-level key */
+};
+
+typedef struct {
+    yaml_parser_t parser;
+    int           depth;        /* current mapping nesting depth */
+    int           state;        /* PD_* */
+    char          key[NAME_LEN]; /* last scalar key seen */
+
+    /* Current node being built. */
+    topo_node    *cur_node;
+
+    /* Current connection being built. */
+    connection   *cur_conn;
+    int           conn_alloc;   /* allocated slots in cur_node->conns */
+
+    /* Current init_conn being built. */
+    init_conn    *cur_ic;
+    int           ic_alloc;
+
+    /* Node array (grows with doubling). */
+    topo_node    *nodes;
+    int           num_nodes;
+    int           max_nodes;
+} parse_ctx;
+
+static int ensure_node_cap(parse_ctx *pc)
 {
-    if (!n || n->type != YAML_SCALAR_NODE) return NULL;
-    return (const char *)n->data.scalar.value;
-}
-
-static yaml_node_t *map_get(yaml_document_t *doc, yaml_node_t *map,
-                            const char *key)
-{
-    if (!map || map->type != YAML_MAPPING_NODE) return NULL;
-    for (yaml_node_pair_t *p = map->data.mapping.pairs.start;
-         p < map->data.mapping.pairs.top; p++) {
-        yaml_node_t *k = yaml_document_get_node(doc, p->key);
-        if (k && k->type == YAML_SCALAR_NODE &&
-            strcmp((const char *)k->data.scalar.value, key) == 0)
-            return yaml_document_get_node(doc, p->value);
-    }
-    return NULL;
-}
-
-static const char *map_str(yaml_document_t *doc, yaml_node_t *map,
-                           const char *key)
-{
-    return scalar_val(doc, map_get(doc, map, key));
-}
-
-/* ------------------------------------------------------------------ */
-/*  YAML parsing                                                       */
-/* ------------------------------------------------------------------ */
-
-static int parse_init_conns(yaml_document_t *doc, yaml_node_t *node,
-                            connection *conn)
-{
-    if (!node || node->type != YAML_MAPPING_NODE) return 0;
-
-    int count = (int)(node->data.mapping.pairs.top
-                    - node->data.mapping.pairs.start);
-    if (count <= 0) return 0;
-
-    conn->init_conns = calloc(count, sizeof(init_conn));
-    if (!conn->init_conns) return -1;
-
-    for (yaml_node_pair_t *p = node->data.mapping.pairs.start;
-         p < node->data.mapping.pairs.top; p++) {
-        yaml_node_t *val = yaml_document_get_node(doc, p->value);
-        const char *s = map_str(doc, val, "sender");
-        const char *r = map_str(doc, val, "receiver");
-        init_conn *ic = &conn->init_conns[conn->num_init_conns++];
-        if (s) strncpy(ic->sender,   s, NAME_LEN - 1);
-        if (r) strncpy(ic->receiver, r, NAME_LEN - 1);
-    }
+    if (pc->num_nodes < pc->max_nodes) return 0;
+    int new_max = pc->max_nodes ? pc->max_nodes * 2 : 64;
+    topo_node *tmp = realloc(pc->nodes, new_max * sizeof(topo_node));
+    if (!tmp) return -1;
+    memset(tmp + pc->max_nodes, 0, (new_max - pc->max_nodes) * sizeof(topo_node));
+    pc->nodes = tmp;
+    pc->max_nodes = new_max;
     return 0;
 }
 
-static int parse_connections(yaml_document_t *doc, yaml_node_t *node,
-                             topo_node *tn)
+static int ensure_conn_cap(parse_ctx *pc)
 {
-    if (!node || node->type != YAML_MAPPING_NODE) return 0;
-
-    int count = (int)(node->data.mapping.pairs.top
-                    - node->data.mapping.pairs.start);
-    if (count <= 0) return 0;
-
-    tn->conns = calloc(count, sizeof(connection));
-    if (!tn->conns) return -1;
-
-    for (yaml_node_pair_t *p = node->data.mapping.pairs.start;
-         p < node->data.mapping.pairs.top; p++) {
-        yaml_node_t *key = yaml_document_get_node(doc, p->key);
-        yaml_node_t *val = yaml_document_get_node(doc, p->value);
-        const char *port_s = scalar_val(doc, key);
-        if (!port_s) continue;
-
-        connection *c = &tn->conns[tn->num_conns++];
-        memset(c, 0, sizeof(*c));
-        c->port_num = atoi(port_s);
-        c->other_node_idx = -1;
-
-        const char *on = map_str(doc, val, "other_node");
-        if (on) strncpy(c->other_node, on, NAME_LEN - 1);
-
-        const char *op = map_str(doc, val, "other_port");
-        if (op) c->other_port = atoi(op);
-
-        const char *bw = map_str(doc, val, "max_bandwidth");
-        if (bw) c->max_bandwidth = parse_bandwidth(bw);
-
-        yaml_node_t *ic = map_get(doc, val, "initial_connections");
-        if (ic && parse_init_conns(doc, ic, c) < 0) return -1;
-    }
+    topo_node *n = pc->cur_node;
+    if (n->num_conns < pc->conn_alloc) return 0;
+    int new_cap = pc->conn_alloc ? pc->conn_alloc * 2 : 4;
+    connection *tmp = realloc(n->conns, new_cap * sizeof(connection));
+    if (!tmp) return -1;
+    memset(tmp + pc->conn_alloc, 0, (new_cap - pc->conn_alloc) * sizeof(connection));
+    n->conns = tmp;
+    pc->conn_alloc = new_cap;
     return 0;
 }
 
-static int parse_node_entry(yaml_document_t *doc, yaml_node_t *entry,
-                            topo_node *tn)
+static int ensure_ic_cap(parse_ctx *pc)
 {
-
-    const char *name = map_str(doc, entry, "name");
-    if (name) strncpy(tn->name, name, NAME_LEN - 1);
-
-    const char *type = map_str(doc, entry, "type");
-    if (!type) { fprintf(stderr, "node missing type\n"); return -1; }
-    if      (strcmp(type, "sender")          == 0) tn->type = NODE_SENDER;
-    else if (strcmp(type, "receiver")        == 0) tn->type = NODE_RECEIVER;
-    else if (strcmp(type, "sender-receiver") == 0) tn->type = NODE_SENDER_RECEIVER;
-    else if (strcmp(type, "switch")          == 0) tn->type = NODE_SWITCH;
-    else { fprintf(stderr, "unknown type '%s'\n", type); return -1; }
-
-    /* sender fields */
-    if (node_is_sender(tn)) {
-        const char *sid = map_str(doc, entry, "sender_id");
-        if (sid) tn->sender_id = strtoull(sid, NULL, 0);
-
-        const char *sib = map_str(doc, entry, "sender_id_bytes");
-        if (sib) tn->sender_id_bytes = atoi(sib);
-
-        const char *bw = map_str(doc, entry, "max_bandwidth");
-        if (bw) tn->max_bandwidth = parse_bandwidth(bw);
-
-        const char *ir = map_str(doc, entry, "initial_receiver");
-        if (ir) strncpy(tn->initial_receiver, ir, NAME_LEN - 1);
-
-        const char *gid = map_str(doc, entry, "group_id");
-        if (gid) tn->group_id = (uint32_t)strtoul(gid, NULL, 0);
-    }
-
-    /* receiver fields */
-    if (node_is_receiver(tn)) {
-        const char *rid = map_str(doc, entry, "receiver_id");
-        if (rid) tn->receiver_id = (uint32_t)strtoul(rid, NULL, 0);
-    }
-
-    /* switch fields */
-    if (tn->type == NODE_SWITCH) {
-        const char *stg = map_str(doc, entry, "switch_type_group");
-        if (stg) strncpy(tn->switch_type_group, stg, NAME_LEN - 1);
-    }
-
-    yaml_node_t *conns = map_get(doc, entry, "connections");
-    if (conns) parse_connections(doc, conns, tn);
-
+    connection *c = pc->cur_conn;
+    if (c->num_init_conns < pc->ic_alloc) return 0;
+    int new_cap = pc->ic_alloc ? pc->ic_alloc * 2 : 4;
+    init_conn *tmp = realloc(c->init_conns, new_cap * sizeof(init_conn));
+    if (!tmp) return -1;
+    memset(tmp + pc->ic_alloc, 0, (new_cap - pc->ic_alloc) * sizeof(init_conn));
+    c->init_conns = tmp;
+    pc->ic_alloc = new_cap;
     return 0;
+}
+
+/* Apply a key-value pair to the current node. */
+static void apply_node_field(parse_ctx *pc, const char *val)
+{
+    topo_node *n = pc->cur_node;
+    const char *k = pc->key;
+
+    if (strcmp(k, "name") == 0)
+        strncpy(n->name, val, NAME_LEN - 1);
+    else if (strcmp(k, "type") == 0) {
+        if      (strcmp(val, "sender")          == 0) n->type = NODE_SENDER;
+        else if (strcmp(val, "receiver")        == 0) n->type = NODE_RECEIVER;
+        else if (strcmp(val, "sender-receiver") == 0) n->type = NODE_SENDER_RECEIVER;
+        else if (strcmp(val, "switch")          == 0) n->type = NODE_SWITCH;
+    }
+    else if (strcmp(k, "sender_id") == 0)
+        n->sender_id = strtoull(val, NULL, 0);
+    else if (strcmp(k, "sender_id_bytes") == 0)
+        n->sender_id_bytes = atoi(val);
+    else if (strcmp(k, "max_bandwidth") == 0)
+        n->max_bandwidth = parse_bandwidth(val);
+    else if (strcmp(k, "initial_receiver") == 0)
+        strncpy(n->initial_receiver, val, NAME_LEN - 1);
+    else if (strcmp(k, "group_id") == 0)
+        n->group_id = (uint32_t)strtoul(val, NULL, 0);
+    else if (strcmp(k, "receiver_id") == 0)
+        n->receiver_id = (uint32_t)strtoul(val, NULL, 0);
+    else if (strcmp(k, "switch_type_group") == 0)
+        strncpy(n->switch_type_group, val, NAME_LEN - 1);
+}
+
+static void apply_conn_field(parse_ctx *pc, const char *val)
+{
+    connection *c = pc->cur_conn;
+    const char *k = pc->key;
+
+    if (strcmp(k, "other_node") == 0)
+        strncpy(c->other_node, val, NAME_LEN - 1);
+    else if (strcmp(k, "other_port") == 0)
+        c->other_port = atoi(val);
+    else if (strcmp(k, "max_bandwidth") == 0)
+        c->max_bandwidth = parse_bandwidth(val);
+}
+
+static void apply_ic_field(parse_ctx *pc, const char *val)
+{
+    init_conn *ic = pc->cur_ic;
+    const char *k = pc->key;
+
+    if (strcmp(k, "sender") == 0)
+        strncpy(ic->sender, val, NAME_LEN - 1);
+    else if (strcmp(k, "receiver") == 0)
+        strncpy(ic->receiver, val, NAME_LEN - 1);
 }
 
 static int parse_yaml(const char *path, didaqt_ctrl_ctx *ctx)
@@ -404,52 +406,173 @@ static int parse_yaml(const char *path, didaqt_ctrl_ctx *ctx)
     FILE *fp = fopen(path, "r");
     if (!fp) { perror(path); return DIDAQT_ERR; }
 
-    yaml_parser_t parser;
-    yaml_document_t doc;
-    if (!yaml_parser_initialize(&parser)) {
+    parse_ctx pc;
+    memset(&pc, 0, sizeof(pc));
+
+    if (!yaml_parser_initialize(&pc.parser)) {
         fprintf(stderr, "yaml_parser_initialize failed\n");
         fclose(fp);
         return DIDAQT_ERR;
     }
-    yaml_parser_set_input_file(&parser, fp);
+    yaml_parser_set_input_file(&pc.parser, fp);
 
-    if (!yaml_parser_load(&parser, &doc)) {
-        fprintf(stderr, "YAML parse error: %s\n", parser.problem);
-        yaml_parser_delete(&parser);
-        fclose(fp);
-        return DIDAQT_ERR;
+    pc.state = PD_TOP;
+    int err = 0;
+    int done = 0;
+    int map_depth = 0;    /* nesting depth for skipping unknown mappings */
+    int skip_depth = 0;   /* > 0 means we're skipping an unknown subtree */
+
+    while (!done && !err) {
+        yaml_event_t ev;
+        if (!yaml_parser_parse(&pc.parser, &ev)) {
+            fprintf(stderr, "YAML parse error: %s\n", pc.parser.problem);
+            err = 1;
+            break;
+        }
+
+        /* Skip unknown nested structures. */
+        if (skip_depth > 0) {
+            if (ev.type == YAML_MAPPING_START_EVENT ||
+                ev.type == YAML_SEQUENCE_START_EVENT)
+                skip_depth++;
+            else if (ev.type == YAML_MAPPING_END_EVENT ||
+                     ev.type == YAML_SEQUENCE_END_EVENT)
+                skip_depth--;
+            yaml_event_delete(&ev);
+            continue;
+        }
+
+        switch (ev.type) {
+        case YAML_STREAM_END_EVENT:
+            done = 1;
+            break;
+
+        case YAML_SEQUENCE_START_EVENT:
+            /* Root sequence — nothing to do. */
+            break;
+
+        case YAML_MAPPING_START_EVENT:
+            map_depth++;
+            if (pc.state == PD_TOP) {
+                /* Start of a new node entry. */
+                if (ensure_node_cap(&pc) < 0) { err = 1; break; }
+                pc.cur_node = &pc.nodes[pc.num_nodes];
+                memset(pc.cur_node, 0, sizeof(topo_node));
+                pc.conn_alloc = 0;
+                pc.state = PD_NODE_KEY;
+            } else if (pc.state == PD_CONNS) {
+                /* Start of a connection (port number was the key). */
+                if (ensure_conn_cap(&pc) < 0) { err = 1; break; }
+                connection *c = &pc.cur_node->conns[pc.cur_node->num_conns];
+                memset(c, 0, sizeof(*c));
+                c->port_num = atoi(pc.key);
+                c->other_node_idx = -1;
+                pc.cur_conn = c;
+                pc.ic_alloc = 0;
+                pc.state = PD_CONN_KEY;
+            } else if (pc.state == PD_INITCONNS) {
+                /* Start of an init_conn entry. */
+                if (ensure_ic_cap(&pc) < 0) { err = 1; break; }
+                pc.cur_ic = &pc.cur_conn->init_conns[pc.cur_conn->num_init_conns];
+                memset(pc.cur_ic, 0, sizeof(*pc.cur_ic));
+                pc.state = PD_INITCONN_KEY;
+            } else {
+                /* Unknown nested mapping — skip it. */
+                skip_depth = 1;
+            }
+            break;
+
+        case YAML_MAPPING_END_EVENT:
+            map_depth--;
+            if (pc.state == PD_NODE_KEY) {
+                /* End of a node entry. */
+                pc.num_nodes++;
+                pc.cur_node = NULL;
+                pc.state = PD_TOP;
+            } else if (pc.state == PD_CONN_KEY) {
+                /* End of a connection entry. */
+                pc.cur_node->num_conns++;
+                pc.cur_conn = NULL;
+                pc.state = PD_CONNS;
+            } else if (pc.state == PD_CONNS) {
+                /* End of the 'connections' mapping. */
+                pc.state = PD_NODE_KEY;
+            } else if (pc.state == PD_INITCONN_KEY) {
+                /* End of an init_conn entry. */
+                pc.cur_conn->num_init_conns++;
+                pc.cur_ic = NULL;
+                pc.state = PD_INITCONNS;
+            } else if (pc.state == PD_INITCONNS) {
+                /* End of 'initial_connections' mapping. */
+                pc.state = PD_CONN_KEY;
+            }
+            break;
+
+        case YAML_SCALAR_EVENT: {
+            const char *val = (const char *)ev.data.scalar.value;
+
+            if (pc.state == PD_NODE_KEY) {
+                /* This scalar is a key in the node mapping. */
+                strncpy(pc.key, val, NAME_LEN - 1);
+                pc.key[NAME_LEN - 1] = '\0';
+                if (strcmp(val, "connections") == 0)
+                    pc.state = PD_CONNS;
+                else
+                    pc.state = PD_NODE;
+            } else if (pc.state == PD_NODE) {
+                /* Value for a node-level key. */
+                apply_node_field(&pc, val);
+                pc.state = PD_NODE_KEY;
+            } else if (pc.state == PD_CONNS) {
+                /* Key inside connections = port number. */
+                strncpy(pc.key, val, NAME_LEN - 1);
+                pc.key[NAME_LEN - 1] = '\0';
+            } else if (pc.state == PD_CONN_KEY) {
+                /* Key inside a connection. */
+                strncpy(pc.key, val, NAME_LEN - 1);
+                pc.key[NAME_LEN - 1] = '\0';
+                if (strcmp(val, "initial_connections") == 0)
+                    pc.state = PD_INITCONNS;
+                else
+                    pc.state = PD_CONN;
+            } else if (pc.state == PD_CONN) {
+                /* Value for a connection-level key. */
+                apply_conn_field(&pc, val);
+                pc.state = PD_CONN_KEY;
+            } else if (pc.state == PD_INITCONNS) {
+                /* Key inside initial_connections = entry number. */
+                strncpy(pc.key, val, NAME_LEN - 1);
+                pc.key[NAME_LEN - 1] = '\0';
+            } else if (pc.state == PD_INITCONN_KEY) {
+                /* Key inside an init_conn. */
+                strncpy(pc.key, val, NAME_LEN - 1);
+                pc.key[NAME_LEN - 1] = '\0';
+                pc.state = PD_INITCONN;
+            } else if (pc.state == PD_INITCONN) {
+                /* Value for an init_conn field. */
+                apply_ic_field(&pc, val);
+                pc.state = PD_INITCONN_KEY;
+            }
+            break;
+        }
+
+        default:
+            break;
+        }
+
+        yaml_event_delete(&ev);
     }
 
-    yaml_node_t *root = yaml_document_get_root_node(&doc);
-    if (!root || root->type != YAML_SEQUENCE_NODE) {
-        fprintf(stderr, "YAML root must be a sequence\n");
-        yaml_document_delete(&doc);
-        yaml_parser_delete(&parser);
-        fclose(fp);
-        return DIDAQT_ERR;
-    }
-
-    /* Count nodes and allocate. */
-    int node_count = (int)(root->data.sequence.items.top
-                         - root->data.sequence.items.start);
-    ctx->nodes = calloc(node_count, sizeof(topo_node));
-    if (!ctx->nodes) {
-        yaml_document_delete(&doc);
-        yaml_parser_delete(&parser);
-        fclose(fp);
-        return DIDAQT_ERR;
-    }
-
-    for (yaml_node_item_t *it = root->data.sequence.items.start;
-         it < root->data.sequence.items.top; it++) {
-        yaml_node_t *entry = yaml_document_get_node(&doc, *it);
-        if (parse_node_entry(&doc, entry, &ctx->nodes[ctx->num_nodes]) == 0)
-            ctx->num_nodes++;
-    }
-
-    yaml_document_delete(&doc);
-    yaml_parser_delete(&parser);
+    yaml_parser_delete(&pc.parser);
     fclose(fp);
+
+    if (err) {
+        free_nodes(pc.nodes, pc.num_nodes);
+        return DIDAQT_ERR;
+    }
+
+    ctx->nodes = pc.nodes;
+    ctx->num_nodes = pc.num_nodes;
     return DIDAQT_OK;
 }
 
