@@ -1,9 +1,10 @@
 /*
  * overhead_traffic_gen.c — Multi-sender raw frame generator
  *
- * Sends a continuous stream of 1500-byte Ethernet frames simulating
- * N senders.  Frame format matches examples/sender.c (Ethernet/IPv4/
- * UDP with SENDER_MAGIC), with sender_id encoded in IP header byte 14.
+ * Sends 1500-byte Ethernet frames simulating N senders at a target
+ * bitrate of 10 Gbps (~833K fps).  Frame format matches
+ * examples/sender.c (Ethernet/IPv4/UDP with SENDER_MAGIC), with
+ * sender_id encoded in IP header byte 14.
  *
  * No VLAN tag (for L2Bridge benchmarking).
  *
@@ -21,6 +22,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <time.h>
 
 #include <arpa/inet.h>
 #include <net/ethernet.h>
@@ -36,6 +38,11 @@
 #define UDP_HDR_LEN    8
 
 #define SENDER_MAGIC   0xD1DA0754CAFE00AAULL
+
+/* Rate limiting: target 10 Gbps.  Send in 1ms batches. */
+#define TARGET_BPS     10000000000ULL      /* 10 Gbps */
+#define BATCH_NS       1000000L            /* 1 ms */
+#define FRAMES_PER_BATCH  ((int)(TARGET_BPS / (FRAME_LEN * 8ULL) / (1000000000ULL / BATCH_NS)))
 
 static volatile int running = 1;
 
@@ -164,19 +171,38 @@ int main(int argc, char **argv)
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
+    fprintf(stderr, "traffic_gen: %d senders, target %d frames/ms (%.1f Gbps)\n",
+            num_senders, FRAMES_PER_BATCH,
+            (double)FRAMES_PER_BATCH * FRAME_LEN * 8 / 1e6);
+
     uint64_t tx_count = 0;
     int idx = 0;
 
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+
     while (running) {
-        ssize_t n = send(sockfd, frames[idx], FRAME_LEN, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            perror("send");
-            break;
+        /* Send one batch of frames. */
+        for (int b = 0; b < FRAMES_PER_BATCH && running; b++) {
+            ssize_t n = send(sockfd, frames[idx], FRAME_LEN, 0);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                perror("send");
+                running = 0;
+                break;
+            }
+            tx_count++;
+            idx++;
+            if (idx >= num_senders) idx = 0;
         }
-        tx_count++;
-        idx++;
-        if (idx >= num_senders) idx = 0;
+
+        /* Sleep until the next 1ms boundary. */
+        next.tv_nsec += BATCH_NS;
+        if (next.tv_nsec >= 1000000000L) {
+            next.tv_nsec -= 1000000000L;
+            next.tv_sec++;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
 
     close(sockfd);

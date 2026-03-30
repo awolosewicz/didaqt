@@ -7,10 +7,15 @@
  *
  * Usage:
  *   ./overhead_ctrl <port> <topology_yaml> <num_receivers>
- *                   <senders_per_hb> <mode>
+ *                   <senders_per_hb> <mode> [ready_file]
  *
  *   mode: "didaqt"   — full heartbeat processing
  *         "baseline" — receive packets, skip process_heartbeat
+ *
+ *   ready_file: if provided, this file is created after the controller
+ *               has loaded the topology, primed senders, and bound the
+ *               UDP socket — signaling that the heartbeat generator
+ *               can begin sending.
  *
  * Output (stdout, one CSV line):
  *   num_receivers,senders_per_hb,mode,cpu_user_us,cpu_sys_us,
@@ -81,10 +86,10 @@ static long tv_to_us(struct timeval *tv)
 
 int main(int argc, char **argv)
 {
-    if (argc != 6) {
+    if (argc < 6 || argc > 7) {
         fprintf(stderr,
                 "Usage: %s <port> <topology_yaml> <num_receivers> "
-                "<senders_per_hb> <mode>\n", argv[0]);
+                "<senders_per_hb> <mode> [ready_file]\n", argv[0]);
         return 1;
     }
 
@@ -93,6 +98,7 @@ int main(int argc, char **argv)
     int num_receivers     = atoi(argv[3]);
     int senders_per_hb    = atoi(argv[4]);
     const char *mode      = argv[5];
+    const char *ready_file = (argc >= 7) ? argv[6] : NULL;
 
     int use_didaqt = (strcmp(mode, "didaqt") == 0);
 
@@ -158,6 +164,12 @@ int main(int argc, char **argv)
     signal(SIGTERM, handle_signal);
 
     fprintf(stderr, "ctrl: listening on port %u, mode=%s\n", port, mode);
+
+    /* Signal readiness so the heartbeat generator can start. */
+    if (ready_file) {
+        FILE *rf = fopen(ready_file, "w");
+        if (rf) { fprintf(rf, "ready\n"); fclose(rf); }
+    }
 
     /* --- Warmup phase --- */
     struct timespec ts_start, ts_now;
