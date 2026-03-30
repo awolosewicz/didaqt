@@ -171,11 +171,22 @@ int main(int argc, char **argv)
         if (rf) { fprintf(rf, "ready\n"); fclose(rf); }
     }
 
-    /* --- Warmup phase --- */
+    /* --- Wait for first packet, then start warmup --- */
     struct timespec ts_start, ts_now;
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
-
     uint8_t pkt[MAX_PKT_SIZE];
+
+    while (running) {
+        ssize_t n = recv(sockfd, pkt, sizeof(pkt), 0);
+        if (n < 0) continue;
+        if (n >= 6) {
+            if (use_didaqt)
+                didaqt_ctrl_process_heartbeat(pkt, (size_t)n, ctx);
+            break;
+        }
+    }
+
+    fprintf(stderr, "ctrl: first packet received, starting warmup\n");
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
     while (running) {
         clock_gettime(CLOCK_MONOTONIC, &ts_now);
