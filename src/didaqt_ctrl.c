@@ -1717,6 +1717,22 @@ int didaqt_ctrl_process_topology(const char *yaml_path,
 
     setup_initial_state(ctx);
 
+    /* Free connection arrays — only needed during DFS path finding and
+     * validation, both of which are complete by this point.  The node
+     * array itself is kept (runtime needs sender_id, group_id, name,
+     * receiver_id, switch_type_group).  Setting conns to NULL lets
+     * free_nodes() in destroy() safely skip them. */
+    for (int i = 0; i < ctx->num_nodes; i++) {
+        topo_node *n = &ctx->nodes[i];
+        if (n->conns) {
+            for (int c = 0; c < n->num_conns; c++)
+                free(n->conns[c].init_conns);
+            free(n->conns);
+            n->conns = NULL;
+            n->num_conns = 0;
+        }
+    }
+
     return DIDAQT_OK;
 }
 
