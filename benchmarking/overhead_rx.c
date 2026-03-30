@@ -2,7 +2,8 @@
  * overhead_rx.c — Receiver CPU/memory overhead benchmark
  *
  * Receives raw Ethernet frames and optionally processes them through
- * the DiDAQt heartbeat scheduler.  Reports CPU time and peak RSS.
+ * the DiDAQt heartbeat scheduler.  Reports CPU time per frame and
+ * current RSS.
  *
  * Usage:
  *   sudo ./overhead_rx <interface> <num_senders> <ctrl_ip> <ctrl_port> <mode>
@@ -11,7 +12,7 @@
  *         "baseline" — same receive loop, no DiDAQt calls
  *
  * Output (stdout, one CSV line):
- *   num_senders,mode,cpu_user_us,cpu_sys_us,peak_rss_kb,frames_received
+ *   num_senders,mode,cpu_ns_per_frame,rss_kb,frames_received
  */
 
 #define _GNU_SOURCE
@@ -61,6 +62,23 @@ static int l2_hdr_len(const uint8_t *frame)
 static long tv_to_us(struct timeval *tv)
 {
     return tv->tv_sec * 1000000L + tv->tv_usec;
+}
+
+/* Read current VmRSS from /proc/self/status (KB). */
+static long read_current_rss_kb(void)
+{
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long rss_kb = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            sscanf(line + 6, " %ld", &rss_kb);
+            break;
+        }
+    }
+    fclose(f);
+    return rss_kb;
 }
 
 int main(int argc, char **argv)
@@ -197,16 +215,21 @@ int main(int argc, char **argv)
     }
 
     getrusage(RUSAGE_SELF, &ru_after);
+    long rss_kb = read_current_rss_kb();
 
-    long cpu_user_us = tv_to_us(&ru_after.ru_utime)
-                     - tv_to_us(&ru_before.ru_utime);
-    long cpu_sys_us  = tv_to_us(&ru_after.ru_stime)
-                     - tv_to_us(&ru_before.ru_stime);
-    long peak_rss_kb = ru_after.ru_maxrss;
+    long cpu_total_us = (tv_to_us(&ru_after.ru_utime)
+                       - tv_to_us(&ru_before.ru_utime))
+                      + (tv_to_us(&ru_after.ru_stime)
+                       - tv_to_us(&ru_before.ru_stime));
 
-    printf("%d,%s,%ld,%ld,%ld,%lu\n",
-           num_senders, mode, cpu_user_us, cpu_sys_us,
-           peak_rss_kb, (unsigned long)frames_received);
+    /* CPU nanoseconds per frame. */
+    long cpu_ns_per_frame = 0;
+    if (frames_received > 0)
+        cpu_ns_per_frame = cpu_total_us * 1000 / (long)frames_received;
+
+    printf("%d,%s,%ld,%ld,%lu\n",
+           num_senders, mode, cpu_ns_per_frame, rss_kb,
+           (unsigned long)frames_received);
 
     close(sockfd);
     if (use_didaqt)
