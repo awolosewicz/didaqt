@@ -10,7 +10,7 @@ LIB       = $(BUILD_DIR)/libdidaqt.a
 SRCS = $(wildcard $(SRC_DIR)/*.c)
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
-.PHONY: all clean examples bench
+.PHONY: all clean examples bench bench_overhead
 
 all: $(LIB)
 
@@ -45,6 +45,23 @@ $(BUILD_DIR)/heartbeat_monitor: artifact/heartbeat_monitor.c | $(BUILD_DIR)
 bench: $(BUILD_DIR)/bench_ctrl
 
 $(BUILD_DIR)/bench_ctrl: benchmarking/bench_ctrl.c $(LIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -O2 -o $@ $< -L$(BUILD_DIR) -ldidaqt -lyaml -lpthread
+
+# --- Overhead benchmarks ---
+
+bench_overhead: $(BUILD_DIR)/overhead_traffic_gen $(BUILD_DIR)/overhead_rx \
+                $(BUILD_DIR)/overhead_hb_gen $(BUILD_DIR)/overhead_ctrl
+
+$(BUILD_DIR)/overhead_traffic_gen: benchmarking/overhead_traffic_gen.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -O2 -o $@ $<
+
+$(BUILD_DIR)/overhead_rx: benchmarking/overhead_rx.c $(LIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -O2 -o $@ $< -L$(BUILD_DIR) -ldidaqt -lyaml -lpthread
+
+$(BUILD_DIR)/overhead_hb_gen: benchmarking/overhead_hb_gen.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -O2 -o $@ $<
+
+$(BUILD_DIR)/overhead_ctrl: benchmarking/overhead_ctrl.c $(LIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -O2 -o $@ $< -L$(BUILD_DIR) -ldidaqt -lyaml -lpthread
 
 clean:
