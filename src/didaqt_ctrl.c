@@ -171,6 +171,9 @@ struct didaqt_ctrl_ctx {
     /* Event callback for failover timing. */
     didaqt_event_fn event_fn;
     void           *event_user_data;
+
+    /* Benchmark timing: compute_ordering duration in nanoseconds. */
+    long compute_ordering_ns;
 };
 
 /* ------------------------------------------------------------------ */
@@ -909,6 +912,9 @@ static int find_all_paths(didaqt_ctrl_ctx *ctx)
 
 static int compute_ordering(didaqt_ctrl_ctx *ctx)
 {
+    struct timespec co_t0, co_t1;
+    clock_gettime(CLOCK_MONOTONIC, &co_t0);
+
     int P = ctx->num_paths;
     int N = ctx->num_nodes;
 
@@ -1034,6 +1040,11 @@ static int compute_ordering(didaqt_ctrl_ctx *ctx)
     }
     free(count);
     free(offset);
+
+    clock_gettime(CLOCK_MONOTONIC, &co_t1);
+    ctx->compute_ordering_ns = (co_t1.tv_sec  - co_t0.tv_sec) * 1000000000L
+                             + (co_t1.tv_nsec - co_t0.tv_nsec);
+
     return DIDAQT_OK;
 }
 
@@ -1991,6 +2002,11 @@ static void free_nodes(topo_node *nodes, int num_nodes)
         }
     }
     free(nodes);
+}
+
+long didaqt_ctrl_get_ordering_time(const didaqt_ctrl_ctx *ctx)
+{
+    return ctx ? ctx->compute_ordering_ns : 0;
 }
 
 void didaqt_ctrl_destroy(didaqt_ctrl_ctx *ctx)

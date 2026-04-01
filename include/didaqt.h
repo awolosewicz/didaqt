@@ -208,6 +208,13 @@ int didaqt_ctrl_set_path_status(didaqt_ctrl_ctx *ctx,
 int didaqt_ctrl_revive_sender(didaqt_ctrl_ctx *ctx, uint64_t sender_id);
 
 /*
+ * didaqt_ctrl_get_ordering_time — Return the wall-clock time in
+ * nanoseconds spent in the compute_ordering step of process_topology.
+ * Only valid after a successful process_topology call.
+ */
+long didaqt_ctrl_get_ordering_time(const didaqt_ctrl_ctx *ctx);
+
+/*
  * didaqt_ctrl_destroy — Free all resources.
  */
 void didaqt_ctrl_destroy(didaqt_ctrl_ctx *ctx);

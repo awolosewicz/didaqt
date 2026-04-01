@@ -42,9 +42,12 @@ $(BUILD_DIR)/heartbeat_monitor: artifact/heartbeat_monitor.c | $(BUILD_DIR)
 
 # --- Benchmarks ---
 
-bench: $(BUILD_DIR)/bench_ctrl
+bench: $(BUILD_DIR)/bench_ctrl $(BUILD_DIR)/bench_ctrl_extra
 
 $(BUILD_DIR)/bench_ctrl: benchmarking/bench_ctrl.c $(LIB) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -O2 -o $@ $< -L$(BUILD_DIR) -ldidaqt -lyaml -lpthread
+
+$(BUILD_DIR)/bench_ctrl_extra: benchmarking/bench_ctrl_extra.c $(LIB) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -O2 -o $@ $< -L$(BUILD_DIR) -ldidaqt -lyaml -lpthread
 
 # --- Overhead benchmarks ---
