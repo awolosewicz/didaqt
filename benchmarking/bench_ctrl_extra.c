@@ -100,14 +100,18 @@ int main(int argc, char **argv)
     didaqt_ctrl_set_grace_period(ctx, 0);
     didaqt_ctrl_set_event_callback(ctx, event_cb, NULL);
 
-    /* ---- Preprocess ---- */
+    /* ---- Measure preprocessing ---- */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     if (didaqt_ctrl_process_topology(yaml_path, ctx) != DIDAQT_OK) {
         fprintf(stderr, "process_topology failed\n");
         didaqt_ctrl_destroy(ctx);
         return 1;
     }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
 
-    long sort_ns = didaqt_ctrl_get_ordering_time(ctx);
+    long preprocess_ns = (t1.tv_sec - t0.tv_sec) * 1000000000L
+                        + (t1.tv_nsec - t0.tv_nsec);
 
     if (didaqt_ctrl_register_handler(ctx, "tofino2", mock_handler, NULL)
         != DIDAQT_OK) {
@@ -309,11 +313,11 @@ int main(int argc, char **argv)
     }
 
     /* ---- Output results ---- */
-    fprintf(stderr, "active_receivers=%d switches=%d sort=%.3fms "
+    fprintf(stderr, "active_receivers=%d switches=%d preprocess=%.3fms "
             "paths_per_sender=%d\n",
-            active_recv, switch_count, sort_ns / 1e6, s1_path_count);
+            active_recv, switch_count, preprocess_ns / 1e6, s1_path_count);
 
-    printf("%d,%d,%ld,%d\n", active_recv, switch_count, sort_ns,
+    printf("%d,%d,%ld,%d\n", active_recv, switch_count, preprocess_ns,
            s1_path_count);
 
     for (int t = 0; t < NUM_TRIALS; t++) {
