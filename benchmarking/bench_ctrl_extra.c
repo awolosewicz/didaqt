@@ -180,22 +180,6 @@ int main(int argc, char **argv)
     fprintf(stderr, "sender 1: %d paths, used_idx=%d, used_rid=%u\n",
             s1_path_count, s1_used_idx, s1_used_rid);
 
-    /* ---- Collect all senders at the USED receiver for heartbeats ---- */
-    uint32_t recv_sids[MAX_SENDERS_PER_RECV];
-    int recv_sid_count = 0;
-    {
-        didaqt_path_info *ps;
-        int pc;
-        didaqt_ctrl_get_path_statuses(ctx, &ps, &pc);
-        for (int i = 0; i < pc; i++) {
-            if (ps[i].status == DIDAQT_PATH_USED &&
-                ps[i].receiver_id == s1_used_rid &&
-                recv_sid_count < MAX_SENDERS_PER_RECV)
-                recv_sids[recv_sid_count++] = (uint32_t)ps[i].sender_id;
-        }
-        free(ps);
-    }
-
     /* ---- Mark all senders as "seen" ---- */
     {
         /* Send heartbeats for all receivers via a full path scan. */
