@@ -284,6 +284,7 @@ int main(int argc, char **argv)
 
     long preprocess_ns = (t1.tv_sec - t0.tv_sec) * 1000000000L
                         + (t1.tv_nsec - t0.tv_nsec);
+    long sort_ns = didaqt_ctrl_get_ordering_time(ctx);
 
     /* Register mock handler. */
     if (didaqt_ctrl_register_handler(ctx, "tofino2", mock_handler, NULL)
@@ -379,10 +380,12 @@ int main(int argc, char **argv)
     }
 
     /* ---- Output results ---- */
-    fprintf(stderr, "active_receivers=%d switches_per_path=%d preprocess=%.3fms\n",
-            active_recv, switch_count, preprocess_ns / 1e6);
+    fprintf(stderr, "active_receivers=%d switches_per_path=%d "
+            "preprocess=%.3fms sort=%.3fms\n",
+            active_recv, switch_count, preprocess_ns / 1e6, sort_ns / 1e6);
 
-    printf("%d,%d,%ld\n", active_recv, switch_count, preprocess_ns);
+    printf("%d,%d,%ld,%ld\n", active_recv, switch_count, preprocess_ns,
+           sort_ns);
 
     for (int t = 0; t < NUM_TRIALS; t++) {
         if (decisions[t] < 0)
