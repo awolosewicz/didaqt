@@ -165,20 +165,6 @@ static void send_all_heartbeats(didaqt_ctrl_ctx *ctx)
     }
 }
 
-/* Send heartbeat for a single receiver by rid, using the map. */
-static void send_one_heartbeat(didaqt_ctrl_ctx *ctx, uint32_t rid)
-{
-    if ((int)rid >= rid_to_bucket_sz) return;
-    int b = rid_to_bucket[rid];
-    if (b < 0) return;
-
-    uint8_t buf[6 + MAX_SENDERS_PER_RECV * 4];
-    int len = build_hb(rid, buckets[b].senders, buckets[b].count,
-                       buf, sizeof(buf));
-    if (len > 0)
-        didaqt_ctrl_process_heartbeat(buf, (size_t)len, ctx);
-}
-
 /* Get the senders at a receiver from the map. */
 static int get_bucket_senders(uint32_t rid, uint32_t *out, int max_out)
 {
