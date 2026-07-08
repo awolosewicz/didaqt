@@ -15,17 +15,21 @@
  * R2) — it has no awareness of the fault-detection framework.
  *
  * Flags:
- *   -f    Faulty mode: alternate between valid and invalid magic
- *         values every packet, simulating intermittent data corruption.
- *   -o    Send one faulty packet then resume normal operation.
+ *   -f       Faulty mode: alternate between valid and invalid magic
+ *            values every packet, simulating intermittent data corruption.
+ *   -o       Send one faulty packet then resume normal operation.
+ *   -r pps   Rate-limit to <pps> frames per second (0 = unpaced, the
+ *            default).  Useful when the data path traverses software
+ *            switches (e.g. BMv2) that cannot keep up with line rate.
  *
  * Usage:
- *   ./sender [-f|-o] <interface> <dst_mac> <sender_id> [vlan_id]
+ *   ./sender [-f|-o] [-r pps] <interface> <dst_mac> <sender_id> [vlan_id]
  *
  * Example:
  *   ./sender eth0 00:11:22:33:44:55 1 100
  *   ./sender -f eth0 00:11:22:33:44:55 1 100
  *   ./sender -o eth0 00:11:22:33:44:55 1 100
+ *   ./sender -r 1000 eth0 00:11:22:33:44:55 1 100
  *
  * Build (on a Linux host):
  *   gcc -O2 -Wall -o sender sender.c
@@ -176,19 +180,27 @@ int main(int argc, char **argv)
     /* Parse optional flags. */
     int faulty = 0;       /* -f: alternate every packet */
     int single_fault = 0; /* -o: one bad packet then normal */
-    if (argc > 1 && strcmp(argv[1], "-f") == 0) {
-        faulty = 1;
-        argv++;
-        argc--;
-    } else if (argc > 1 && strcmp(argv[1], "-o") == 0) {
-        single_fault = 1;
-        argv++;
-        argc--;
+    long rate_pps = 0;    /* -r: frames/sec (0 = unpaced) */
+    while (argc > 1 && argv[1][0] == '-') {
+        if (strcmp(argv[1], "-f") == 0) {
+            faulty = 1;
+            argv++; argc--;
+        } else if (strcmp(argv[1], "-o") == 0) {
+            single_fault = 1;
+            argv++; argc--;
+        } else if (strcmp(argv[1], "-r") == 0 && argc > 2) {
+            rate_pps = atol(argv[2]);
+            argv += 2; argc -= 2;
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[1]);
+            return 1;
+        }
     }
 
     if (argc < 4 || argc > 5) {
         fprintf(stderr,
-                "Usage: %s [-f|-o] <interface> <dst_mac> <sender_id> [vlan_id]\n",
+                "Usage: %s [-f|-o] [-r pps] <interface> <dst_mac> "
+                "<sender_id> [vlan_id]\n",
                 argv[0]);
         return 1;
     }
@@ -262,9 +274,19 @@ int main(int argc, char **argv)
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
+    /* Inter-frame gap for rate limiting (0 = unpaced). */
+    struct timespec gap = {0, 0};
+    if (rate_pps > 0) {
+        gap.tv_sec  = (rate_pps == 1) ? 1 : 0;
+        gap.tv_nsec = (rate_pps > 1) ? (long)(1000000000L / rate_pps) : 0;
+    }
+
     const char *mode = faulty ? " [FAULTY]" : single_fault ? " [ONE-FAULT]" : "";
-    printf("sender %u: sending %d-byte frames on %s -> %s (vlan %u)%s\n",
-           sender_id, FRAME_LEN, ifname, dst_mac_s, vlan_id, mode);
+    char rate_str[32] = "";
+    if (rate_pps > 0)
+        snprintf(rate_str, sizeof(rate_str), " @ %ld pps", rate_pps);
+    printf("sender %u: sending %d-byte frames on %s -> %s (vlan %u)%s%s\n",
+           sender_id, FRAME_LEN, ifname, dst_mac_s, vlan_id, mode, rate_str);
 
     /* --- Transmit loop --- */
     uint64_t tx_count = 0;
@@ -284,6 +306,8 @@ int main(int argc, char **argv)
             break;
         }
         tx_count++;
+        if (rate_pps > 0)
+            nanosleep(&gap, NULL);
     }
 
     close(sockfd);
