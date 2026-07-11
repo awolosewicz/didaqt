@@ -1,15 +1,17 @@
 /*
  * sender.c — Example DAQ data sender
  *
- * Sends a continuous stream of 1500-byte Ethernet frames over a raw
+ * Sends a continuous stream of 1484-byte Ethernet frames over a raw
  * AF_PACKET socket.  Each frame is Ethernet/802.1Q/IPv4/UDP with an
  * 8-byte magic value (SENDER_MAGIC) at the start of the UDP payload,
- * followed by padding to fill the frame.
+ * followed by padding to fill the frame.  The frame size leaves 16
+ * bytes of headroom below a 1500-byte MTU for the Crinkle monitor's
+ * UID trailer (see fablib crease/monitor_source.c).
  *
  * When vlan_id is 0, frames are sent without a VLAN tag and the full
- * 1458-byte payload is available.  When vlan_id > 0, the 4-byte
- * 802.1Q header is included and the payload shrinks to 1454 bytes
- * so the total frame stays at 1500.
+ * 1442-byte payload is available.  When vlan_id > 0, the 4-byte
+ * 802.1Q header is included and the payload shrinks to 1438 bytes
+ * so the total frame stays at 1484.
  *
  * The sender is a "black box" from DiDAQt's perspective (requirement
  * R2) — it has no awareness of the fault-detection framework.
@@ -57,7 +59,7 @@
 /*  Constants                                                       */
 /* --------------------------------------------------------------- */
 
-#define FRAME_LEN      1500            /* Total Ethernet frame size */
+#define FRAME_LEN      1484            /* Total Ethernet frame size */
 #define ETH_HDR_LEN    14
 #define VLAN_HDR_LEN   4
 #define IP_HDR_LEN     20
