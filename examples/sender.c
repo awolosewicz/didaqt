@@ -29,9 +29,16 @@
  *            to MACs they do not own (e.g. FABRIC SR-IOV shared NICs);
  *            switches then match on the source field (see
  *            examples/p4/l2_forward_bmv2.p4).
+ *   -l len   Frame length in bytes (default and max 1484, min 64).
+ *            Shrink when in-band metadata must fit under a 1500-byte
+ *            MTU downstream: the Crinkle monitor's analyzer report
+ *            wraps the whole frame plus its 16-byte UID trailer in an
+ *            88-byte header (see fablib crease/monitor_source.c), so
+ *            monitored deployments need len <= 1410 for reports to
+ *            reach the analyzer.
  *
  * Usage:
- *   ./sender [-f|-o] [-b] [-r pps] <interface> <dst_mac> <sender_id> [vlan_id]
+ *   ./sender [-f|-o] [-b] [-r pps] [-l len] <interface> <dst_mac> <sender_id> [vlan_id]
  *
  * Example:
  *   ./sender eth0 00:11:22:33:44:55 1 100
@@ -114,9 +121,10 @@ static uint16_t ip_checksum(const void *buf, int len)
  * Build a complete Ethernet(/VLAN)/IPv4/UDP frame template.
  * src/dst IPs are arbitrary — the switches forward on MAC only.
  *
- * Returns the actual frame length written (always FRAME_LEN).
+ * Returns the actual frame length written (always frame_len).
  */
 static int build_frame(uint8_t *frame,
+                       int frame_len,
                        const uint8_t src_mac[6],
                        const uint8_t dst_mac[6],
                        uint32_t sender_id,
@@ -124,9 +132,9 @@ static int build_frame(uint8_t *frame,
 {
     int use_vlan = (vlan_id > 0);
     int l2_len   = ETH_HDR_LEN + (use_vlan ? VLAN_HDR_LEN : 0);
-    int payload_len = FRAME_LEN - l2_len - IP_HDR_LEN - UDP_HDR_LEN;
+    int payload_len = frame_len - l2_len - IP_HDR_LEN - UDP_HDR_LEN;
 
-    memset(frame, 0, FRAME_LEN);
+    memset(frame, 0, frame_len);
 
     /* --- Ethernet header --- */
     uint8_t *p = frame;
@@ -176,7 +184,7 @@ static int build_frame(uint8_t *frame,
     for (int i = 8; i + 3 < payload_len; i += 4)
         memcpy(payload + i, &sid_n, 4);
 
-    return FRAME_LEN;
+    return frame_len;
 }
 
 /* --------------------------------------------------------------- */
@@ -190,6 +198,7 @@ int main(int argc, char **argv)
     int single_fault = 0; /* -o: one bad packet then normal */
     long rate_pps = 0;    /* -r: frames/sec (0 = unpaced) */
     int bcast_route = 0;  /* -b: broadcast dst, routing MAC in source */
+    int frame_len = FRAME_LEN; /* -l: frame length in bytes */
     while (argc > 1 && argv[1][0] == '-') {
         if (strcmp(argv[1], "-f") == 0) {
             faulty = 1;
@@ -203,6 +212,9 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[1], "-r") == 0 && argc > 2) {
             rate_pps = atol(argv[2]);
             argv += 2; argc -= 2;
+        } else if (strcmp(argv[1], "-l") == 0 && argc > 2) {
+            frame_len = atoi(argv[2]);
+            argv += 2; argc -= 2;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[1]);
             return 1;
@@ -211,9 +223,15 @@ int main(int argc, char **argv)
 
     if (argc < 4 || argc > 5) {
         fprintf(stderr,
-                "Usage: %s [-f|-o] [-b] [-r pps] <interface> <dst_mac> "
+                "Usage: %s [-f|-o] [-b] [-r pps] [-l len] <interface> <dst_mac> "
                 "<sender_id> [vlan_id]\n",
                 argv[0]);
+        return 1;
+    }
+
+    if (frame_len < 64 || frame_len > FRAME_LEN) {
+        fprintf(stderr, "Frame length must be 64..%d, got %d\n",
+                FRAME_LEN, frame_len);
         return 1;
     }
 
@@ -280,11 +298,11 @@ int main(int argc, char **argv)
     /* Build frame templates. */
     uint8_t frame_good[FRAME_LEN];
     uint8_t frame_bad[FRAME_LEN];
-    build_frame(frame_good, src_mac, dst_mac, sender_id, vlan_id);
+    build_frame(frame_good, frame_len, src_mac, dst_mac, sender_id, vlan_id);
 
     if (faulty || single_fault) {
         /* Build a second template with an invalid magic value. */
-        memcpy(frame_bad, frame_good, FRAME_LEN);
+        memcpy(frame_bad, frame_good, frame_len);
         int use_vlan = (vlan_id > 0);
         int l2_len   = ETH_HDR_LEN + (use_vlan ? VLAN_HDR_LEN : 0);
         int magic_off = l2_len + IP_HDR_LEN + UDP_HDR_LEN;
@@ -308,7 +326,7 @@ int main(int argc, char **argv)
     if (rate_pps > 0)
         snprintf(rate_str, sizeof(rate_str), " @ %ld pps", rate_pps);
     printf("sender %u: sending %d-byte frames on %s -> %s (vlan %u)%s%s%s\n",
-           sender_id, FRAME_LEN, ifname, dst_mac_s, vlan_id, mode, route, rate_str);
+           sender_id, frame_len, ifname, dst_mac_s, vlan_id, mode, route, rate_str);
 
     /* --- Transmit loop --- */
     uint64_t tx_count = 0;
@@ -321,7 +339,7 @@ int main(int argc, char **argv)
             frame = frame_bad;
         else
             frame = frame_good;
-        ssize_t n = send(sockfd, frame, FRAME_LEN, 0);
+        ssize_t n = send(sockfd, frame, frame_len, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
             perror("send");
