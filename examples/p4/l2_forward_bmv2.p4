@@ -3,16 +3,20 @@
  *
  * The software-switch counterpart of examples/p4/l2_forward.p4 (which
  * targets Tofino 2 / TNA).  Parses Ethernet and an optional 802.1Q VLAN
- * header, then does an exact match on the destination MAC address to
- * pick an egress port.
+ * header, then does an exact match on the SOURCE MAC address to pick an
+ * egress port.
  *
- * In the butterfly demo the destination MAC is always a receiver's NIC
- * MAC, so every switch on a path forwards purely on that MAC.  Butterfly
- * self-routing is expressed entirely in the table entries: at each rank,
- * the entry for a given receiver MAC points at the "straight" or "cross"
- * egress port according to the relevant bit of the receiver index.  The
- * notebook (or the bmv2 switch agent) populates and updates the
- * "l2_forward" table at runtime via simple_switch_CLI.
+ * In the butterfly demo frames are sent to the broadcast MAC and carry
+ * the routing MAC (the target receiver's NIC MAC) in the source field
+ * (sender -b).  Unicast destinations cannot be used on fabrics whose
+ * SR-IOV NICs silently drop frames addressed to MACs they do not own
+ * (e.g. FABRIC shared NICs); broadcast destinations always pass, so the
+ * routing key moves to the source field.  Butterfly self-routing is
+ * unchanged: at each rank, the entry for a given routing MAC points at
+ * the "straight" or "cross" egress port according to the relevant bit
+ * of the receiver index.  The notebook (or the bmv2 switch agent)
+ * populates and updates the "l2_forward" table at runtime via
+ * simple_switch_CLI.
  *
  * Unlike the Tofino program this does NOT rewrite the VLAN id: with
  * single-site L2Bridge links each hop is an untagged access port, so the
@@ -94,7 +98,7 @@ control MyIngress(
 
     table l2_forward {
         key = {
-            hdr.ethernet.dst_addr : exact;
+            hdr.ethernet.src_addr : exact;
         }
         actions = {
             forward;

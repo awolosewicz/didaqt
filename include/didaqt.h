@@ -80,10 +80,12 @@ typedef struct didaqt_ctrl_ctx didaqt_ctrl_ctx;
 
 /*
  * Switch handler callback — invoked per switch when executing a
- * failover.  Port values are -1 when the switch is not part of
- * that path (i.e. pure add or pure remove).
+ * failover.  switch_name is the topology node name of the switch
+ * being updated.  Port values are -1 when the switch is not part
+ * of that path (i.e. pure add or pure remove).
  */
 typedef int (*didaqt_switch_handler_fn)(
+    const char *switch_name,
     uint64_t sender_id,
     int cur_ingress, int cur_egress,
     int new_ingress, int new_egress,

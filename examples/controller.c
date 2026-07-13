@@ -9,15 +9,21 @@
  * scrolling log of failover events.
  *
  * Usage:
- *   ./controller [-m miss] [-g grace_ms] <topology.yaml>
+ *   ./controller [-m miss] [-g grace_ms] [-s agent_map] <topology.yaml>
  *                <heartbeat_port> [switch_ipv6]
  *
  * Options:
  *   -m miss      Consecutive missed heartbeats before failover (default 3)
  *   -g grace_ms  Post-failover grace period in ms (default 1000)
+ *   -s agent_map Per-switch agent map file, one "<switch_name> <ipv6>"
+ *                per line.  UPDATE commands are routed to the named
+ *                switch's agent and carry the switch name in the
+ *                payload ("UPDATE <name> <sid> ...").  The positional
+ *                switch_ipv6 argument keeps the legacy single-agent
+ *                format ("UPDATE <sid> ...") for the Tofino artifact.
  *
  * Requires: CAP_NET_RAW for ICMPv6 switch communication (run with
- * sudo); not needed in log-only mode (no switch_ipv6 argument).
+ * sudo); not needed in log-only mode (no agent map or switch_ipv6).
  */
 
 #define _GNU_SOURCE
@@ -153,13 +159,45 @@ static void draw_display(uint16_t hb_port)
 /*  ICMPv6 switch agent connection                                     */
 /* ------------------------------------------------------------------ */
 
-#define DIDAQT_ICMP_ID  0xDDAA
+#define DIDAQT_ICMP_ID   0xDDAA
+#define DIDAQT_MAX_AGENTS 64
 
 typedef struct {
-    int                sockfd;
+    char                name[DIDAQT_MAX_NAME];
     struct sockaddr_in6 dest;
-    uint16_t           seq;
+} agent_entry;
+
+typedef struct {
+    int                 sockfd;
+    struct sockaddr_in6 dest;        /* legacy single-agent destination */
+    uint16_t            seq;
+    agent_entry         agents[DIDAQT_MAX_AGENTS];
+    int                 num_agents;  /* > 0: per-switch agent map mode */
 } switch_conn;
+
+static int open_icmp6_socket(void)
+{
+    int fd = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    if (fd < 0) {
+        perror("socket (ICMPv6 raw)");
+        return -1;
+    }
+
+    struct icmp6_filter filt;
+    ICMP6_FILTER_SETBLOCKALL(&filt);
+    ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filt);
+    if (setsockopt(fd, IPPROTO_ICMPV6, ICMP6_FILTER,
+                   &filt, sizeof(filt)) < 0)
+        perror("setsockopt ICMP6_FILTER");
+
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt SO_RCVTIMEO (ICMPv6)");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
 
 static int switch_conn_open(switch_conn *sc, const char *addr)
 {
@@ -173,43 +211,72 @@ static int switch_conn_open(switch_conn *sc, const char *addr)
     }
     sc->dest.sin6_family = AF_INET6;
 
-    sc->sockfd = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
-    if (sc->sockfd < 0) {
-        perror("socket (ICMPv6 raw)");
-        return -1;
-    }
-
-    struct icmp6_filter filt;
-    ICMP6_FILTER_SETBLOCKALL(&filt);
-    ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filt);
-    if (setsockopt(sc->sockfd, IPPROTO_ICMPV6, ICMP6_FILTER,
-                   &filt, sizeof(filt)) < 0)
-        perror("setsockopt ICMP6_FILTER");
-
-    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-    if (setsockopt(sc->sockfd, SOL_SOCKET, SO_RCVTIMEO,
-                   &tv, sizeof(tv)) < 0) {
-        perror("setsockopt SO_RCVTIMEO (ICMPv6)");
-        close(sc->sockfd);
-        sc->sockfd = -1;
-        return -1;
-    }
-
-    return 0;
+    sc->sockfd = open_icmp6_socket();
+    return sc->sockfd < 0 ? -1 : 0;
 }
 
-static long switch_conn_send(switch_conn *sc, const char *cmd,
-                             char *resp_out, size_t resp_sz)
+/*
+ * Load a per-switch agent map: one "<switch_name> <ipv6>" pair per
+ * line.  UPDATE commands are then routed to the named switch's agent
+ * (payload gains the switch name) instead of a single shared agent.
+ */
+static int switch_conn_load_map(switch_conn *sc, const char *path)
 {
-    if (sc->sockfd < 0) return 0;
+    memset(sc, 0, sizeof(*sc));
+    sc->sockfd = -1;
 
-    uint16_t seq = sc->seq++;
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        perror(path);
+        return -1;
+    }
+
+    char name[DIDAQT_MAX_NAME], addr[128];
+    while (fscanf(f, "%63s %127s", name, addr) == 2) {
+        if (sc->num_agents >= DIDAQT_MAX_AGENTS) {
+            fprintf(stderr, "agent map: too many entries (max %d)\n",
+                    DIDAQT_MAX_AGENTS);
+            fclose(f);
+            return -1;
+        }
+        agent_entry *a = &sc->agents[sc->num_agents];
+        snprintf(a->name, sizeof(a->name), "%s", name);
+        if (inet_pton(AF_INET6, addr, &a->dest.sin6_addr) != 1) {
+            fprintf(stderr, "agent map: bad IPv6 address for %s: %s\n",
+                    name, addr);
+            fclose(f);
+            return -1;
+        }
+        a->dest.sin6_family = AF_INET6;
+        sc->num_agents++;
+    }
+    fclose(f);
+
+    if (sc->num_agents == 0) {
+        fprintf(stderr, "agent map: no entries in %s\n", path);
+        return -1;
+    }
+
+    sc->sockfd = open_icmp6_socket();
+    return sc->sockfd < 0 ? -1 : 0;
+}
+
+static const struct sockaddr_in6 *find_agent(const switch_conn *sc,
+                                             const char *name)
+{
+    for (int i = 0; i < sc->num_agents; i++)
+        if (strcmp(sc->agents[i].name, name) == 0)
+            return &sc->agents[i].dest;
+    return NULL;
+}
+
+static size_t build_echo_request(uint8_t *pkt, size_t cap,
+                                 uint16_t seq, const char *cmd)
+{
     size_t cmd_len = strlen(cmd);
-
     size_t pkt_len = 8 + cmd_len;
-    uint8_t pkt[8 + 256];
-    if (pkt_len > sizeof(pkt)) {
-        pkt_len = sizeof(pkt);
+    if (pkt_len > cap) {
+        pkt_len = cap;
         cmd_len = pkt_len - 8;
     }
 
@@ -220,12 +287,48 @@ static long switch_conn_send(switch_conn *sc, const char *cmd,
     pkt[6] = (seq >> 8) & 0xFF;
     pkt[7] = seq & 0xFF;
     memcpy(pkt + 8, cmd, cmd_len);
+    return pkt_len;
+}
+
+/* Fire-and-forget send (keepalives); replies are drained later. */
+static void switch_conn_send_noreply(switch_conn *sc,
+                                     const struct sockaddr_in6 *dest,
+                                     const char *cmd)
+{
+    if (sc->sockfd < 0) return;
+    if (!dest) dest = &sc->dest;
+
+    uint8_t pkt[8 + 256];
+    size_t pkt_len = build_echo_request(pkt, sizeof(pkt), sc->seq++, cmd);
+    sendto(sc->sockfd, pkt, pkt_len, 0,
+           (const struct sockaddr *)dest, sizeof(*dest));
+}
+
+static long switch_conn_send(switch_conn *sc,
+                             const struct sockaddr_in6 *dest,
+                             const char *cmd,
+                             char *resp_out, size_t resp_sz)
+{
+    if (sc->sockfd < 0) return 0;
+    if (!dest) dest = &sc->dest;
+
+    uint16_t seq = sc->seq++;
+    uint8_t pkt[8 + 256];
+    size_t pkt_len = build_echo_request(pkt, sizeof(pkt), seq, cmd);
+
+    /* Drain stale replies (from fire-and-forget keepalives and the
+     * kernel's own echo responses) so the matching loop below only
+     * has fresh packets to look at. */
+    uint8_t drain[8 + 256];
+    while (recvfrom(sc->sockfd, drain, sizeof(drain), MSG_DONTWAIT,
+                    NULL, NULL) >= 0)
+        ;
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
     if (sendto(sc->sockfd, pkt, pkt_len, 0,
-               (struct sockaddr *)&sc->dest, sizeof(sc->dest)) < 0)
+               (const struct sockaddr *)dest, sizeof(*dest)) < 0)
         return -1;
 
     uint8_t buf[8 + 256];
@@ -311,7 +414,7 @@ static void event_handler(const didaqt_event *ev,
 /*  Switch handler                                                     */
 /* ------------------------------------------------------------------ */
 
-static int switch_handler(uint64_t sender_id,
+static int switch_handler(const char *switch_name, uint64_t sender_id,
                           int cur_in, int cur_out,
                           int new_in, int new_out,
                           void *user_data)
@@ -319,30 +422,57 @@ static int switch_handler(uint64_t sender_id,
     switch_conn *sc = (switch_conn *)user_data;
 
     if (sc->sockfd < 0) {
-        log_event("SWITCH sender=%lu (%d,%d)->(%d,%d) [log-only]",
-                  (unsigned long)sender_id,
+        log_event("SWITCH %s sender=%lu (%d,%d)->(%d,%d) [log-only]",
+                  switch_name, (unsigned long)sender_id,
                   cur_in, cur_out, new_in, new_out);
         return 0;
     }
 
+    const struct sockaddr_in6 *dest = NULL;
     char cmd[128];
-    snprintf(cmd, sizeof(cmd), "UPDATE %lu %d %d %d %d",
-             (unsigned long)sender_id,
-             cur_in, cur_out, new_in, new_out);
+    if (sc->num_agents > 0) {
+        dest = find_agent(sc, switch_name);
+        if (!dest) {
+            log_event("SWITCH %s sender=%lu: no agent in map, skipped",
+                      switch_name, (unsigned long)sender_id);
+            return 0;
+        }
+        snprintf(cmd, sizeof(cmd), "UPDATE %s %lu %d %d %d %d",
+                 switch_name, (unsigned long)sender_id,
+                 cur_in, cur_out, new_in, new_out);
+    } else {
+        snprintf(cmd, sizeof(cmd), "UPDATE %lu %d %d %d %d",
+                 (unsigned long)sender_id,
+                 cur_in, cur_out, new_in, new_out);
+    }
 
     char resp[128] = {0};
-    long us = switch_conn_send(sc, cmd, resp, sizeof(resp));
+    long us = switch_conn_send(sc, dest, cmd, resp, sizeof(resp));
     if (us < 0) {
-        log_event("SWITCH sender=%lu (%d,%d)->(%d,%d) FAILED",
-                  (unsigned long)sender_id,
+        log_event("SWITCH %s sender=%lu (%d,%d)->(%d,%d) FAILED",
+                  switch_name, (unsigned long)sender_id,
                   cur_in, cur_out, new_in, new_out);
         return -1;
     }
 
-    log_event("SWITCH sender=%lu (%d,%d)->(%d,%d) t_switch=%.3fms rtt=%ldus %s",
-              (unsigned long)sender_id,
+    log_event("SWITCH %s sender=%lu (%d,%d)->(%d,%d) t_switch=%.3fms rtt=%ldus %s",
+              switch_name, (unsigned long)sender_id,
               cur_in, cur_out, new_in, new_out, us / 2000.0, us, resp);
     return 0;
+}
+
+/* Keepalives prevent cold-path latency on the agent links.  In map
+ * mode they are fire-and-forget so 32 agents do not serialize 32
+ * reply round-trips inside the heartbeat loop. */
+static void send_keepalives(switch_conn *sc)
+{
+    if (sc->sockfd < 0) return;
+    if (sc->num_agents > 0) {
+        for (int i = 0; i < sc->num_agents; i++)
+            switch_conn_send_noreply(sc, &sc->agents[i].dest, "KA");
+    } else {
+        switch_conn_send(sc, NULL, "KA", NULL, 0);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -353,6 +483,7 @@ int main(int argc, char **argv)
 {
     int miss_threshold = DIDAQT_DEFAULT_MISS_THRESHOLD;
     long grace_ms      = DIDAQT_DEFAULT_GRACE_PERIOD_NS / 1000000L;
+    const char *agent_map = NULL;
 
     /* Parse optional flags. */
     while (argc > 1 && argv[1][0] == '-') {
@@ -362,6 +493,9 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[1], "-g") == 0 && argc > 2) {
             grace_ms = atol(argv[2]);
             argv += 2; argc -= 2;
+        } else if (strcmp(argv[1], "-s") == 0 && argc > 2) {
+            agent_map = argv[2];
+            argv += 2; argc -= 2;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[1]);
             return 1;
@@ -370,8 +504,8 @@ int main(int argc, char **argv)
 
     if (argc < 3 || argc > 4) {
         fprintf(stderr,
-                "Usage: %s [-m miss] [-g grace_ms] <topology.yaml> "
-                "<heartbeat_port> [switch_ipv6]\n", argv[0]);
+                "Usage: %s [-m miss] [-g grace_ms] [-s agent_map] "
+                "<topology.yaml> <heartbeat_port> [switch_ipv6]\n", argv[0]);
         return 1;
     }
 
@@ -382,16 +516,38 @@ int main(int argc, char **argv)
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
-    /* ---- Open ICMPv6 channel to switch agent ---- */
+    /* ---- Open ICMPv6 channel to switch agent(s) ---- */
     switch_conn sc;
-    if (switch_conn_open(&sc, agent_addr) < 0) {
+    if (agent_map) {
+        if (switch_conn_load_map(&sc, agent_map) < 0) {
+            fprintf(stderr, "Could not load agent map\n");
+            return 1;
+        }
+    } else if (switch_conn_open(&sc, agent_addr) < 0) {
         fprintf(stderr, "Could not open ICMPv6 channel\n");
         return 1;
     }
 
-    if (sc.sockfd >= 0) {
+    if (sc.num_agents > 0) {
+        int ok = 0;
+        for (int i = 0; i < sc.num_agents; i++) {
+            char resp[64];
+            long us = switch_conn_send(&sc, &sc.agents[i].dest,
+                                       "PING", resp, sizeof(resp));
+            if (us < 0)
+                fprintf(stderr, "agent %s: PING failed (no reply)\n",
+                        sc.agents[i].name);
+            else
+                ok++;
+        }
+        fprintf(stderr, "Switch agents: %d/%d PING OK\n", ok, sc.num_agents);
+        if (ok == 0) {
+            switch_conn_close(&sc);
+            return 1;
+        }
+    } else if (sc.sockfd >= 0) {
         char resp[64];
-        long us = switch_conn_send(&sc, "PING", resp, sizeof(resp));
+        long us = switch_conn_send(&sc, NULL, "PING", resp, sizeof(resp));
         if (us < 0) {
             fprintf(stderr, "Switch agent PING failed (no reply)\n");
             switch_conn_close(&sc);
@@ -499,7 +655,7 @@ int main(int argc, char **argv)
                 long ka_elapsed = (now.tv_sec  - last_ka.tv_sec) * 1000000000L
                                 + (now.tv_nsec - last_ka.tv_nsec);
                 if (ka_elapsed >= 1000000000L && sc.sockfd >= 0) {
-                    switch_conn_send(&sc, "KA", NULL, 0);
+                    send_keepalives(&sc);
                     last_ka = now;
                 }
                 continue;
@@ -518,7 +674,7 @@ int main(int argc, char **argv)
         long ka_elapsed = (now.tv_sec  - last_ka.tv_sec) * 1000000000L
                         + (now.tv_nsec - last_ka.tv_nsec);
         if (ka_elapsed >= 1000000000L && sc.sockfd >= 0) {
-            switch_conn_send(&sc, "KA", NULL, 0);
+            send_keepalives(&sc);
             last_ka = now;
         }
 

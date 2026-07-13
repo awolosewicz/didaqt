@@ -1386,8 +1386,8 @@ static int execute_failover(didaqt_ctrl_ctx *ctx,
         const char *tg = sw->switch_type_group;
         ctrl_handler *h = find_handler(ctx, tg);
         if (h && h->fn) {
-            int rc = h->fn(sender_id, cur_in, cur_out, new_in, new_out,
-                           h->user_data);
+            int rc = h->fn(sw->name, sender_id, cur_in, cur_out,
+                           new_in, new_out, h->user_data);
             if (rc != 0) { free(sw_nodes); return rc; }
         }
     }

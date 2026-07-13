@@ -23,9 +23,15 @@
  *   -r pps   Rate-limit to <pps> frames per second (0 = unpaced, the
  *            default).  Useful when the data path traverses software
  *            switches (e.g. BMv2) that cannot keep up with line rate.
+ *   -b       Broadcast routing: send to ff:ff:ff:ff:ff:ff and carry
+ *            <dst_mac> in the Ethernet source field instead.  For L2
+ *            fabrics whose NICs silently drop unicast frames addressed
+ *            to MACs they do not own (e.g. FABRIC SR-IOV shared NICs);
+ *            switches then match on the source field (see
+ *            examples/p4/l2_forward_bmv2.p4).
  *
  * Usage:
- *   ./sender [-f|-o] [-r pps] <interface> <dst_mac> <sender_id> [vlan_id]
+ *   ./sender [-f|-o] [-b] [-r pps] <interface> <dst_mac> <sender_id> [vlan_id]
  *
  * Example:
  *   ./sender eth0 00:11:22:33:44:55 1 100
@@ -183,12 +189,16 @@ int main(int argc, char **argv)
     int faulty = 0;       /* -f: alternate every packet */
     int single_fault = 0; /* -o: one bad packet then normal */
     long rate_pps = 0;    /* -r: frames/sec (0 = unpaced) */
+    int bcast_route = 0;  /* -b: broadcast dst, routing MAC in source */
     while (argc > 1 && argv[1][0] == '-') {
         if (strcmp(argv[1], "-f") == 0) {
             faulty = 1;
             argv++; argc--;
         } else if (strcmp(argv[1], "-o") == 0) {
             single_fault = 1;
+            argv++; argc--;
+        } else if (strcmp(argv[1], "-b") == 0) {
+            bcast_route = 1;
             argv++; argc--;
         } else if (strcmp(argv[1], "-r") == 0 && argc > 2) {
             rate_pps = atol(argv[2]);
@@ -201,7 +211,7 @@ int main(int argc, char **argv)
 
     if (argc < 4 || argc > 5) {
         fprintf(stderr,
-                "Usage: %s [-f|-o] [-r pps] <interface> <dst_mac> "
+                "Usage: %s [-f|-o] [-b] [-r pps] <interface> <dst_mac> "
                 "<sender_id> [vlan_id]\n",
                 argv[0]);
         return 1;
@@ -245,6 +255,15 @@ int main(int argc, char **argv)
     uint8_t src_mac[6];
     memcpy(src_mac, ifr.ifr_hwaddr.sa_data, 6);
 
+    /* Broadcast routing: the routing MAC rides in the source field so
+     * L2 fabrics that filter on unicast dst MACs pass the frame, and
+     * switches match on the source instead (see
+     * examples/p4/l2_forward_bmv2.p4). */
+    if (bcast_route) {
+        memcpy(src_mac, dst_mac, 6);
+        memset(dst_mac, 0xFF, 6);
+    }
+
     /* Bind to the interface. */
     struct sockaddr_ll sll;
     memset(&sll, 0, sizeof(sll));
@@ -284,11 +303,12 @@ int main(int argc, char **argv)
     }
 
     const char *mode = faulty ? " [FAULTY]" : single_fault ? " [ONE-FAULT]" : "";
+    const char *route = bcast_route ? " [bcast dst, route-by-src]" : "";
     char rate_str[32] = "";
     if (rate_pps > 0)
         snprintf(rate_str, sizeof(rate_str), " @ %ld pps", rate_pps);
-    printf("sender %u: sending %d-byte frames on %s -> %s (vlan %u)%s%s\n",
-           sender_id, FRAME_LEN, ifname, dst_mac_s, vlan_id, mode, rate_str);
+    printf("sender %u: sending %d-byte frames on %s -> %s (vlan %u)%s%s%s\n",
+           sender_id, FRAME_LEN, ifname, dst_mac_s, vlan_id, mode, route, rate_str);
 
     /* --- Transmit loop --- */
     uint64_t tx_count = 0;
