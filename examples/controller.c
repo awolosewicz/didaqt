@@ -649,8 +649,15 @@ int main(int argc, char **argv)
 
     /* ---- Main loop ---- */
     uint8_t buf[6 + DIDAQT_MAX_SENDERS * 4];
-    struct timespec last_ka;
+    struct timespec last_ka, last_draw;
     clock_gettime(CLOCK_MONOTONIC, &last_ka);
+    last_draw = last_ka;
+
+    /* A full-screen redraw per heartbeat dominates the loop: at ~32
+     * heartbeats/s it drops throughput below arrival, so the UDP backlog
+     * grows faster than it drains and failover decisions run minutes late.
+     * Redraw at most every draw_interval_ns instead. */
+    const long draw_interval_ns = 200 * 1000000L;
 
     while (running) {
         struct sockaddr_storage src;
@@ -668,6 +675,12 @@ int main(int argc, char **argv)
                 if (ka_elapsed >= 1000000000L && sc.sockfd >= 0) {
                     send_keepalives(&sc);
                     last_ka = now;
+                }
+                /* Idle: refresh the display, still rate-limited. */
+                if ((now.tv_sec - last_draw.tv_sec) * 1000000000L
+                        + (now.tv_nsec - last_draw.tv_nsec) >= draw_interval_ns) {
+                    draw_display(hb_port);
+                    last_draw = now;
                 }
                 continue;
             }
@@ -689,8 +702,13 @@ int main(int argc, char **argv)
             last_ka = now;
         }
 
-        /* Redraw after each heartbeat. */
-        draw_display(hb_port);
+        /* Redraw at most every draw_interval_ns so a heartbeat backlog can
+         * drain faster than heartbeats arrive. */
+        if ((now.tv_sec - last_draw.tv_sec) * 1000000000L
+                + (now.tv_nsec - last_draw.tv_nsec) >= draw_interval_ns) {
+            draw_display(hb_port);
+            last_draw = now;
+        }
     }
 
     close(sockfd);
