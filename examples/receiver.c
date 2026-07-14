@@ -307,8 +307,16 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    signal(SIGINT,  handle_signal);
-    signal(SIGTERM, handle_signal);
+    /* sigaction without SA_RESTART so the signal interrupts the blocking
+     * recv() below with EINTR.  With signal()'s default SA_RESTART the
+     * syscall auto-restarts, so a receiver whose sender has gone dark (no
+     * frames to return on) never re-checks `running` and ignores SIGTERM --
+     * leaking a process on every workload restart. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     /* Clear screen and draw initial display. */
     printf("\033[2J");
