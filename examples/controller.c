@@ -585,12 +585,19 @@ int main(int argc, char **argv)
     g_ctx = ctx;
 
     /* ---- Register switch handler ---- */
-    if (didaqt_ctrl_register_handler(ctx, "tofino2",
-                                     switch_handler, &sc) != DIDAQT_OK) {
-        fprintf(stderr, "didaqt_ctrl_register_handler failed\n");
-        didaqt_ctrl_destroy(ctx);
-        switch_conn_close(&sc);
-        return 1;
+    /* The handler only sends UPDATE commands to a named agent, so it is
+     * topology-agnostic; register it for every switch_type_group the
+     * example topologies use (Tofino 2 hardware and the BMv2 testbed). */
+    static const char *const switch_type_groups[] = { "tofino2", "bmv2" };
+    for (size_t i = 0; i < sizeof(switch_type_groups) /
+                           sizeof(switch_type_groups[0]); i++) {
+        if (didaqt_ctrl_register_handler(ctx, switch_type_groups[i],
+                                         switch_handler, &sc) != DIDAQT_OK) {
+            fprintf(stderr, "didaqt_ctrl_register_handler failed\n");
+            didaqt_ctrl_destroy(ctx);
+            switch_conn_close(&sc);
+            return 1;
+        }
     }
 
     /* ---- Open heartbeat listener (IPv6 dual-stack) ---- */
