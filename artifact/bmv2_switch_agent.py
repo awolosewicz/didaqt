@@ -116,6 +116,9 @@ class CLI:
 
 
 def main():
+    # Line-buffer stdout so the log stays readable while running detached
+    # (block buffering holds startup lines back indefinitely).
+    sys.stdout.reconfigure(line_buffering=True)
     if len(sys.argv) != 2:
         raise SystemExit("Usage: sudo python3 bmv2_switch_agent.py <conf_file>")
     conf = read_conf(sys.argv[1])

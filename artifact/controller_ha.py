@@ -56,6 +56,9 @@ def parse_args():
 
 def send_heartbeats(peer, port, stop):
     """Emit a heartbeat to the peer every interval until stop is set."""
+    if ":" not in peer:
+        # AF_INET6 sendto rejects dotted-IPv4 destinations outright
+        peer = f"::ffff:{peer}"
     sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
     while not stop.is_set():
         try:
