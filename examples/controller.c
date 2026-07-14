@@ -513,6 +513,10 @@ int main(int argc, char **argv)
     uint16_t hb_port       = (uint16_t)atoi(argv[2]);
     const char *agent_addr = (argc == 4) ? argv[3] : NULL;
 
+    /* Line-buffer stdout so the display and event log stay current when
+     * redirected to a file (block buffering holds them back for minutes). */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
