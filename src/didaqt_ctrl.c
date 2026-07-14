@@ -1437,6 +1437,28 @@ static int in_grace_period(const didaqt_ctrl_ctx *ctx, int sender_idx,
     return elapsed_ns < ctx->grace_period_ns;
 }
 
+/*
+ * True if any alive member of the group other than sender_idx has been
+ * seen at its receiver since the last failover.  When a group failed over
+ * and the groupmates arrived at the new receiver but this sender did not,
+ * the shared path is good and this sender alone is dead -- distinct from a
+ * failover target that never delivered for anyone.
+ */
+static int group_has_seen_member(const didaqt_ctrl_ctx *ctx, uint32_t gid,
+                                 int sender_idx)
+{
+    if (gid == 0 || gid > ctx->max_group_id) return 0;
+    int g_start = ctx->group_start[gid];
+    int g_count = ctx->group_count[gid];
+    for (int gi = 0; gi < g_count; gi++) {
+        int m = ctx->group_members[g_start + gi];
+        if (m == sender_idx) continue;
+        if (!ctx->runtime[m].dead && ctx->runtime[m].seen_at_recv)
+            return 1;
+    }
+    return 0;
+}
+
 /* Reset per-sender state after a successful failover. */
 static void reset_sender_after_failover(didaqt_ctrl_ctx *ctx,
                                         int sender_idx,
@@ -1880,29 +1902,20 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
 
             uint32_t gid = ctx->nodes[s].group_id;
 
-            /* If this sender was never seen at its current receiver
-             * since the last failover, the sender itself is dead —
-             * not the path.  Mark it dead individually and revert
-             * the group to undo the unnecessary failover. */
-            if (!rt->seen_at_recv) {
+            /* A sender still missing at the receiver it was moved to by
+             * the last failover (seen_at_recv == 0) is dead only when the
+             * move itself worked -- i.e. a groupmate did arrive there, so
+             * the shared path is fine and this sender alone is gone.
+             * Otherwise the failover target never delivered, so fall
+             * through and advance to the next path instead of giving up;
+             * genuine death is then reached by exhausting every path in
+             * failover_sender/failover_group. */
+            if (!rt->seen_at_recv && group_has_seen_member(ctx, gid, s)) {
                 rt->dead = 1;
-                fire_event(ctx, DIDAQT_EVENT_DEAD, sid,
-                           ctx->nodes[s].group_id, 0);
-                fprintf(stderr, "sender '%s' (id %lu): never seen at "
-                        "current receiver, marked dead\n",
+                fire_event(ctx, DIDAQT_EVENT_DEAD, sid, gid, 0);
+                fprintf(stderr, "sender '%s' (id %lu): groupmates reached "
+                        "the failover receiver but it did not, marked dead\n",
                         ctx->nodes[s].name, (unsigned long)sid);
-
-                if (gid != 0) {
-                    int already = 0;
-                    for (int g = 0; g < num_handled_groups; g++) {
-                        if (ctx->handled_groups[g] == gid) { already = 1; break; }
-                    }
-                    if (!already) {
-                        failover_group(ctx, gid, &now);
-                        if (num_handled_groups < ctx->num_nodes)
-                            ctx->handled_groups[num_handled_groups++] = gid;
-                    }
-                }
                 continue;
             }
 
