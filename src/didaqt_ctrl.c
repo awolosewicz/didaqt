@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <yaml.h>
 
@@ -1824,6 +1825,15 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
     int recv_idx = id_lookup_find(ctx->recv_lookup, ctx->num_recv_lookup, rid);
     if (recv_idx < 0) return DIDAQT_ERR;
 
+    /* Temporary failover trace: enable by `touch /tmp/didaqt_debug` before
+     * launch.  Reveals per-heartbeat which receiver reported and, for each
+     * Used-but-absent sender, its miss/grace state. */
+    static int dbg = -1;
+    if (dbg < 0) dbg = (access("/tmp/didaqt_debug", F_OK) == 0);
+    if (dbg)
+        fprintf(stderr, "DBG hb rid=%u recv_idx=%d scnt=%u\n",
+                rid, recv_idx, (unsigned)scnt);
+
     /* Auto-revive dead senders that reappear in this heartbeat. */
     for (int si = 0; si < scnt; si++) {
         int s = id_lookup_find(ctx->sender_lookup, ctx->num_sender_lookup,
@@ -1895,7 +1905,14 @@ int didaqt_ctrl_process_heartbeat(const uint8_t *buf, size_t len,
             }
             rt->miss_count = 0;
             confirm_failed(ctx, s);
-        } else if (rt->seen && !in_grace_period(ctx, s, &now)) {
+        } else if (1) {
+            if (dbg)
+                fprintf(stderr, "DBG absent rid=%u sid=%lu seen=%d sar=%d "
+                        "miss=%d grace=%d\n", rid, (unsigned long)sid,
+                        rt->seen, rt->seen_at_recv, rt->miss_count,
+                        in_grace_period(ctx, s, &now));
+            if (!(rt->seen && !in_grace_period(ctx, s, &now)))
+                continue;
             rt->miss_count++;
             if (rt->miss_count < ctx->miss_threshold)
                 continue;
